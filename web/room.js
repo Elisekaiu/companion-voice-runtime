@@ -7,7 +7,7 @@ export function createRoom({api,isActive}) {
   const haptic=()=>{try{navigator.vibrate?.(12);}catch{}};
   function toast(text){clearTimeout(toastTimer);$('room-toast').textContent=text;$('room-toast').classList.add('visible');toastTimer=setTimeout(()=>$('room-toast').classList.remove('visible'),2600);}
   function phase(name){$('phone').dataset.phase=name;window.parent!==window&&window.parent.postMessage({type:'companion-voice-state',active:name==='incoming'||name==='calling'||name==='active'||name==='ending'},location.origin);}
-  function foyer(){const h=localClock().hour;$('foyer-copy').textContent=h>=22||h<8?'Quiet hours. Start whenever you like.':'Ready when you are.';phase('foyer');}
+  function foyer(){const h=localClock().hour;$('foyer-copy').textContent=h>=22||h<8?'夜深了，想什么时候开始都可以。':'你准备好就开始。';phase('foyer');}
   function ask(id){const dialog=$(id);if(dialog.open)return Promise.resolve(false);return new Promise(resolve=>{dialog.addEventListener('close',()=>resolve(dialog.returnValue),{once:true});dialog.returnValue='cancel';dialog.showModal();});}
   function measure(node,kind){const meter=node.context.createAnalyser();meter.fftSize=256;node.connect(meter);meters.set(meter,new Float32Array(256));if(kind==='assistant')assistantMeter=meter;else userMeter=meter;return ()=>{try{node.disconnect(meter);meter.disconnect();}catch{}if(assistantMeter===meter)assistantMeter=null;if(userMeter===meter)userMeter=null;};}
   function rms(meter){if(!meter)return 0;const data=meters.get(meter);meter.getFloatTimeDomainData(data);return Math.min(1,Math.sqrt(data.reduce((s,v)=>s+v*v,0)/data.length)*5);}
@@ -18,34 +18,34 @@ export function createRoom({api,isActive}) {
   window.visualViewport?.addEventListener('resize',viewport);window.addEventListener('resize',viewport);viewport();
   function usageWindowLabel(window){
     const mins=Number(window?.window_duration_mins);
-    if(mins===300)return '5-Hour';
-    if(mins===10080)return 'Weekly';
-    if(Number.isFinite(mins)&&mins>0)return mins>=1440?Math.round(mins/1440)+'-Day':Math.round(mins/60)+'-Hour';
-    return 'Usage';
+    if(mins===300)return '5 小时';
+    if(mins===10080)return '每周';
+    if(Number.isFinite(mins)&&mins>0)return mins>=1440?Math.round(mins/1440)+' 天':Math.round(mins/60)+' 小时';
+    return '用量';
   }
   let roomUsageCodex='Codex —',roomUsageEleven='';
   function syncRoomUsageSummary(){const el=$('usage-room-summary');if(el)el.textContent=[roomUsageCodex,roomUsageEleven].filter(Boolean).join(' · ');}
   function compactCredits(value){const n=Math.max(0,Number(value)||0);return n>=1000?(n/1000).toFixed(1).replace(/\.0$/,'')+'k':Math.round(n).toLocaleString();}
   function renderUsage(usage){
     const detail=$('usage-detail');
-    if(!usage?.available){$('usage-label').textContent='Unavailable';roomUsageCodex='Codex unavailable';syncRoomUsageSummary();detail.innerHTML='<div class="usage-loading">Unavailable</div>';return;}
+    if(!usage?.available){$('usage-label').textContent='不可用';roomUsageCodex='Codex 不可用';syncRoomUsageSummary();detail.innerHTML='<div class="usage-loading">Unavailable</div>';return;}
     const bucket=(usage.buckets||[]).find(x=>x.id==='codex'||x.limit_id==='codex')||(usage.buckets||[])[0];
-    if(!bucket){$('usage-label').textContent='Unavailable';roomUsageCodex='Codex unavailable';syncRoomUsageSummary();detail.innerHTML='<div class="usage-loading">Unavailable</div>';return;}
+    if(!bucket){$('usage-label').textContent='不可用';roomUsageCodex='Codex 不可用';syncRoomUsageSummary();detail.innerHTML='<div class="usage-loading">Unavailable</div>';return;}
     const windows=[bucket.primary,bucket.secondary].filter(Boolean);
-    const roomWindow=windows.find(w=>usageWindowLabel(w)==='Weekly')||windows[0];
-    if(roomWindow){const remaining=Math.max(0,Math.min(100,Number(roomWindow.remaining_percent)||0)),name=usageWindowLabel(roomWindow);roomUsageCodex='Codex '+(name==='Weekly'?'Week':name==='5-Hour'?'5h':name)+' '+remaining+'%';syncRoomUsageSummary();}
+    const roomWindow=windows.find(w=>usageWindowLabel(w)==='每周')||windows[0];
+    if(roomWindow){const remaining=Math.max(0,Math.min(100,Number(roomWindow.remaining_percent)||0)),name=usageWindowLabel(roomWindow);roomUsageCodex='Codex '+(name==='每周'?'每周':name==='5 小时'?'5h':name)+' '+remaining+'%';syncRoomUsageSummary();}
     const short=[];detail.replaceChildren();
     for(const w of windows){
       const remaining=Math.max(0,Math.min(100,Number(w.remaining_percent)||0)),name=usageWindowLabel(w);
-      short.push((name==='5-Hour'?'5h':name==='Weekly'?'Week':name)+' '+remaining+'%');
+      short.push((name==='5 小时'?'5h':name==='每周'?'每周':name)+' '+remaining+'%');
       const row=document.createElement('div');row.className='usage-meter';
       const head=document.createElement('div');head.className='usage-meter-head';
       const label=document.createElement('span');label.className='usage-meter-label';label.textContent=name;
-      const value=document.createElement('span');value.className='usage-meter-value';value.textContent=remaining+'% left';
-      const track=document.createElement('div');track.className='usage-meter-track';track.setAttribute('role','progressbar');track.setAttribute('aria-label',name+' usage remaining');track.setAttribute('aria-valuemin','0');track.setAttribute('aria-valuemax','100');track.setAttribute('aria-valuenow',String(remaining));
+      const value=document.createElement('span');value.className='usage-meter-value';value.textContent=remaining+'% 剩余';
+      const track=document.createElement('div');track.className='usage-meter-track';track.setAttribute('role','progressbar');track.setAttribute('aria-label',name+' 剩余用量');track.setAttribute('aria-valuemin','0');track.setAttribute('aria-valuemax','100');track.setAttribute('aria-valuenow',String(remaining));
       const fill=document.createElement('i');fill.className='usage-meter-fill';fill.style.width=remaining+'%';track.append(fill);head.append(label,value);row.append(head,track);detail.append(row);
     }
-    $('usage-label').textContent=short.join(' · ')||'Available';
+    $('usage-label').textContent=short.join(' · ')||'可用';
   }
   function formatProviderSeconds(seconds){
     const value=Math.max(0,Number(seconds)||0);
@@ -59,24 +59,24 @@ export function createRoom({api,isActive}) {
     if(eleven.available){
       const remaining=Math.max(0,Number(eleven.remaining)||0),limit=Math.max(0,Number(eleven.limit)||0),used=Math.max(0,Number(eleven.used)||0);
       const remainingPct=limit?Math.max(0,Math.min(100,remaining/limit*100)):0;
-      $('usage-eleven-main').textContent=remaining.toLocaleString()+' credits left';
+      $('usage-eleven-main').textContent=remaining.toLocaleString()+' credits 剩余';
       elevenBar.style.width=remainingPct+'%';
-      const reset=eleven.resetAt?new Date(eleven.resetAt).toLocaleDateString([], {month:'short',day:'numeric'}):'reset unavailable';
-      $('usage-eleven-note').textContent=used.toLocaleString()+' / '+limit.toLocaleString()+' used · '+reset;
-      roomUsageEleven='ElevenLabs '+compactCredits(remaining)+' left';syncRoomUsageSummary();
+      const reset=eleven.resetAt?new Date(eleven.resetAt).toLocaleDateString([], {month:'short',day:'numeric'}):'重置时间不可用';
+      $('usage-eleven-note').textContent=used.toLocaleString()+' / '+limit.toLocaleString()+' 已使用 · '+reset;
+      roomUsageEleven='ElevenLabs '+compactCredits(remaining)+' 剩余';syncRoomUsageSummary();
       elevenSetup.classList.add('hidden');
     }else{
       roomUsageEleven='ElevenLabs —';syncRoomUsageSummary();
       elevenBar.style.width='0%';
-      $('usage-eleven-main').textContent=eleven.needsUserRead?'Permission needed':'Usage unavailable';
-      $('usage-eleven-note').textContent=eleven.needsUserRead?'Add a backend-only ElevenLabs key with user_read permission.':'ElevenLabs usage could not be read.';
+      $('usage-eleven-main').textContent=eleven.needsUserRead?'需要权限':'用量不可用';
+      $('usage-eleven-note').textContent=eleven.needsUserRead?'请在后端添加带 user_read 权限的 ElevenLabs key。':'无法读取 ElevenLabs 用量。';
       elevenSetup.classList.toggle('hidden',!eleven.needsUserRead&&!['missing_key'].includes(eleven.reason));
     }
     const seconds=Math.max(0,Number(assembly.sessionSeconds)||0);
-    $('usage-assembly-main').textContent=seconds?formatProviderSeconds(seconds)+' · ~$'+Number(assembly.estimatedUsd||0).toFixed(2):'Tracking starts next call';
-    $('usage-assembly-note').textContent='This deployment · '+(assembly.model||'universal-3-6-pro')+' · ~$'+Number(assembly.rateUsdPerHour||0.45).toFixed(2)+'/h. Local session-duration estimate.';
-    $('usage-tencent-main').textContent=tencent.trtcConfigured?'TRTC connected':'TRTC not connected';
-    $('usage-tencent-note').textContent=tencent.trtcConfigured?'Speech works. Billing/package usage needs separate Tencent Cloud API credentials.':'Connect Tencent STT first; billing credentials are separate.';
+    $('usage-assembly-main').textContent=seconds?formatProviderSeconds(seconds)+' · ~$'+Number(assembly.estimatedUsd||0).toFixed(2):'从下一通电话开始统计';
+    $('usage-assembly-note').textContent='当前部署 · '+(assembly.model||'universal-3-6-pro')+' · ~$'+Number(assembly.rateUsdPerHour||0.45).toFixed(2)+'/h. Local session-duration estimate.';
+    $('usage-tencent-main').textContent=tencent.trtcConfigured?'TRTC 已连接':'TRTC 未连接';
+    $('usage-tencent-note').textContent=tencent.trtcConfigured?'语音已可用；账单 / 套餐用量需要单独的腾讯云 API 凭据。':'请先连接 Tencent STT；账单凭据需要另外配置。';
   }
   let statusRefreshPromise=null,usagePollTimer=null;
   async function refreshStatus(){
@@ -86,8 +86,8 @@ export function createRoom({api,isActive}) {
         api('/api/status',{},'GET'),api('/api/provider-usage',{},'GET')
       ]);
       if(statusResult.status==='fulfilled'){
-        const d=statusResult.value;$('runtime-status').textContent=[d.codexReady?'Codex connected':'Codex unavailable',d.model||'Model unavailable',d.effort||'Effort unavailable',d.shared?'Shared thread':'Shared connection unavailable',d.sttReady?'STT ready':'STT unavailable',d.ttsReady?'TTS ready':'TTS unavailable'].join(' · ');renderUsage(d.usage);
-      }else{$('runtime-status').textContent='Status unavailable';$('usage-label').textContent='Unavailable';}
+        const d=statusResult.value;$('runtime-status').textContent=[d.codexReady?'Codex 已连接':'Codex 不可用',d.model||'模型不可用',d.effort||'Effort 不可用',d.shared?'共享 thread':'共享连接不可用',d.sttReady?'STT 已就绪':'STT 不可用',d.ttsReady?'TTS 已就绪':'TTS 不可用'].join(' · ');renderUsage(d.usage);
+      }else{$('runtime-status').textContent='状态不可用';$('usage-label').textContent='不可用';}
       let providerSection=document.querySelector('.provider-usage-section');
       if(providerResult.status==='fulfilled'){
         providerSection=providerSection||ensureProviderUsageSection({refresh:refreshStatus});

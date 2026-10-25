@@ -30,13 +30,13 @@ export function ensureProviderUsageSection({root=document,refresh=()=>{}}={}){
   section=document.createElement('section');
   section.className='usage-section provider-usage-section';
   section.innerHTML=[
-    '<div class="usage-section-head"><strong>Voice Providers</strong><button id="provider-usage-refresh" type="button" aria-label="Refresh provider usage">↻</button></div>',
+    '<div class="usage-section-head"><strong>语音 Provider</strong><button id="provider-usage-refresh" type="button" aria-label="刷新 Provider 用量">↻</button></div>',
     '<div class="provider-usage-grid">',
-      '<article class="provider-usage-card"><div class="provider-usage-top"><strong>ElevenLabs</strong><span class="usage-badge">Exact</span></div><div id="usage-eleven-main" class="provider-usage-main">Checking…</div><div class="usage-meter-track provider-usage-track"><i id="usage-eleven-bar" class="usage-meter-fill"></i></div><small id="usage-eleven-note" class="provider-usage-note"></small><div id="usage-eleven-setup" class="hidden"></div></article>',
-      '<article class="provider-usage-card"><div class="provider-usage-top"><strong>AssemblyAI</strong><span class="usage-badge local">Local</span></div><div id="usage-assembly-main" class="provider-usage-main">Checking…</div><small id="usage-assembly-note" class="provider-usage-note"></small></article>',
-      '<article class="provider-usage-card"><div class="provider-usage-top"><strong>Tencent</strong><span class="usage-badge provider">Provider</span></div><div id="usage-tencent-main" class="provider-usage-main">Checking…</div><small id="usage-tencent-note" class="provider-usage-note"></small></article>',
+      '<article class="provider-usage-card"><div class="provider-usage-top"><strong>ElevenLabs</strong><span class="usage-badge">精确</span></div><div id="usage-eleven-main" class="provider-usage-main">检查中…</div><div class="usage-meter-track provider-usage-track"><i id="usage-eleven-bar" class="usage-meter-fill"></i></div><small id="usage-eleven-note" class="provider-usage-note"></small><div id="usage-eleven-setup" class="hidden"></div></article>',
+      '<article class="provider-usage-card"><div class="provider-usage-top"><strong>AssemblyAI</strong><span class="usage-badge local">本地</span></div><div id="usage-assembly-main" class="provider-usage-main">检查中…</div><small id="usage-assembly-note" class="provider-usage-note"></small></article>',
+      '<article class="provider-usage-card"><div class="provider-usage-top"><strong>Tencent</strong><span class="usage-badge provider">Provider</span></div><div id="usage-tencent-main" class="provider-usage-main">检查中…</div><small id="usage-tencent-note" class="provider-usage-note"></small></article>',
     '</div>',
-    '<p class="provider-usage-footnote">Exact is provider-reported. Local is tracked by this deployment. Provider means billing needs a separate cloud adapter.</p>'
+    '<p class="provider-usage-footnote">“精确”由 provider 返回；“本地”由当前部署统计；“Provider”表示账单需要额外云端 adapter。</p>'
   ].join('');
   body.append(section);
   section.querySelector('#provider-usage-refresh')?.addEventListener('click',refresh);
