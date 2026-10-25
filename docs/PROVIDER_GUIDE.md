@@ -4,78 +4,133 @@ Companion Voice Runtime uses reference defaults rather than claiming a universal
 
 **Copy the roles, not necessarily our vendors.**
 
-A useful voice-call stack has four roles: a primary realtime STT path, an optional language-specialist sidecar, a transcript arbiter, and an expressive TTS path.
+A useful voice-call stack has four roles: a realtime speech recognizer, an optional second recognizer with a different strength profile, a transcript/turn arbiter, and an expressive TTS path.
 
-## Reference defaults
+## Recommended starting point
 
-- **Primary realtime STT:** AssemblyAI `universal-3-6-pro`
-- **Chinese sidecar:** Tencent TRTC RealtimeTranscriber
-- **STT alternate:** ElevenLabs Scribe v2 Realtime
-- **Reference TTS:** ElevenLabs v4 Turbo
-- **TTS alternates:** Multilingual v2 and Flash v2.5
+### Chinese-heavy calls: enable Tencent first among the optional additions
 
-## Why AssemblyAI is the primary STT
+The reference hybrid implementation still uses AssemblyAI as the primary realtime stream and turn clock. For Mandarin/Chinese-heavy calls, Tencent Cloud realtime speech recognition is the optional addition we most recommend enabling.
 
-The reference client uses `universal-3-6-pro` in `balanced` mode.
+Why:
 
-This choice came from actual calls: short replies, natural pauses, interruptions, names, and Chinese/English code-switching. AssemblyAI also describes Universal-3.6 Pro Realtime as targeting voice-agent short utterances, noisy or phone audio, accents, and code-switching.
+- it exposes dedicated realtime Chinese speech recognition in Tencent's RTC/speech stack;
+- it is designed for streaming 16 kHz/8 kHz mono speech and returns results while audio is arriving;
+- in practice, a Chinese-specialist realtime recognizer can be a better fit for short, chat-like Mandarin utterances than a general multilingual model.
 
-The reference turn-silence settings are:
+That last point is a **practical fit recommendation**, not a claim that this API uses the same recognition model as WeChat. Test it with your own microphone, accent, region and account tier.
+
+Reference: <https://trtc.io/document/80841>
+
+### Primary/general path: AssemblyAI Universal-3.6 Pro Realtime
+
+The reference hybrid client uses AssemblyAI `universal-3-6-pro` as its primary realtime stream and turn clock. It can also run without Tencent. It is useful for short voice-agent utterances, noisy/phone audio, accents, and multilingual/code-switched speech.
+
+AssemblyAI describes Universal-3.6 Pro Realtime as a 32-language realtime model trained for voice-agent/telephony conversations, with automatic language detection and improved short-utterance handling.
+
+Reference: <https://www.assemblyai.com/blog/universal-3-6-pro-realtime>
+
+### Additional fallback: ElevenLabs Scribe v2 Realtime
+
+Scribe remains an optional alternate path for deployments already using ElevenLabs. It is not required by the hybrid design.
+
+## Why the dual-recognizer path exists
+
+Dual recognition is optional. It is useful when two providers fail differently.
+
+The public hybrid flow works like this:
+
+1. Tencent and AssemblyAI may listen to the same microphone stream.
+2. Provider-level `final` events are treated as ASR **segments**, not automatically as the end of the user's thought.
+3. `web/stt-turn-buffer.js` waits for conversational silence before committing the turn.
+4. Late segments from either provider can still join the same user turn.
+5. Repeated provider finals are deduplicated.
+6. `web/stt-arbiter.js` chooses one transcript.
+7. Only one committed turn reaches the companion.
+
+A finalized Chinese Tencent hypothesis can beat a short English hallucination from the primary recognizer. The public repository deliberately avoids deployment-specific word-replacement dictionaries; add any domain vocabulary privately.
+
+## Endpointing defaults
+
+The reference turn buffer waits about:
 
 ```text
-min_turn_silence = 320 ms
-max_turn_silence = 1600 ms
+conversation silence: 1600 ms
+partial timeout:       4200 ms
 ```
 
-They are deliberately not hyper-aggressive. The goal is to avoid chopping an ordinary conversational pause into multiple turns. Treat these values as tuning defaults and re-test them for your own language, microphone, and speaking style.
+The exact provider endpointing settings are less important than the rule above: **provider final != conversation final**.
 
-## Why Tencent is a sidecar
+Re-test these values for your own speaking pace. Very aggressive endpointing feels fast in a demo and terrible in a real conversation.
 
-The hybrid design is intentional:
+## Light-sleep cost control
 
-1. AssemblyAI remains the primary realtime stream and turn clock.
-2. Tencent listens in parallel when configured.
-3. Pure English does not wait for Tencent.
-4. Chinese or mixed-language turns can use Tencent as additional transcript evidence.
-5. `web/stt-arbiter.js` chooses one committed transcript.
-6. Only one committed turn reaches the companion.
+Realtime STT can accumulate session time while the connection remains open.
 
-This pattern is reusable: Tencent can be replaced with another language-specialist STT without changing the overall architecture.
+The current hybrid client uses **light sleep**:
 
-## Why keep Scribe
+- after about 30 seconds of real silence, AssemblyAI can close;
+- if Tencent is configured, Tencent stays online as the wake path;
+- a Tencent transcript can wake AssemblyAI, so soft speech does not have to cross a local volume threshold first;
+- the local RMS speech gate remains a backup wake signal;
+- roughly three seconds of microphone pre-roll are retained and sent to AssemblyAI after reconnect;
+- if Tencent is not available, automatic AssemblyAI sleep is skipped rather than making quiet speech depend on the local gate;
+- manual mute still shuts recognition down deliberately.
 
-Scribe v2 Realtime remains an alternate path for deployments that already use ElevenLabs. It is useful as a fallback, but it is not the current reference default.
+The client also records a local AssemblyAI usage fallback when a browser/network exit prevents the normal provider termination event from arriving. Provider-reported billing remains authoritative; local usage is only a runtime estimate.
 
-## Why v4 Turbo is the reference TTS
+## Why keep one recognizer awake?
 
-The current speech-delivery pipeline has been tuned around ElevenLabs v4 Turbo, including segmentation, delivery presets, playback shaping, and optional performance layers.
+An older design put every cloud recognizer to sleep after 30 seconds and relied on local RMS activity to wake them.
 
-So “default” means **tested and tuned for this project**, not “objectively best for every companion.”
+That saves more connection time, but quiet speech can fall below a local amplitude threshold. Keeping the Chinese sidecar awake gives the runtime a semantic wake signal instead of asking a simple volume gate to decide whether a soft voice was speech.
 
-## Quiet-mode cost control
+If your provider pricing or privacy requirements make this tradeoff unattractive, disable the optimization or change which provider stays awake.
 
-Realtime STT can accumulate billable session time while its realtime connection stays open even when nobody is talking.
+## TTS
 
-The public client therefore includes an idle cloud-STT sleep/wake path:
+The reference TTS path is ElevenLabs v4 Turbo because the speech-delivery pipeline has been tuned around it, including segmentation, delivery presets, playback shaping and optional performance layers.
 
-- after about 30 seconds without speech, the cloud STT session is terminated;
-- the microphone remains local;
-- a lightweight local speech gate watches for new voice activity;
-- roughly 3 seconds of pre-roll are retained;
-- when speech returns, cloud STT reconnects and receives the buffered audio first;
-- the Tencent sidecar sleeps and wakes with the primary cloud STT.
+Multilingual v2 and Flash v2.5 remain alternatives.
 
-This makes long quiet calls practical without paying for an STT connection that is doing nothing.
+“Reference” means **tested and tuned for this project**, not objectively best for every deployment.
 
-At the time this guide was updated (October 2026), AssemblyAI lists Universal-3.6 Pro Realtime at $0.45/hour base and describes realtime billing in terms of session duration. Verify current pricing before relying on any estimate.
+## On-device environmental hearing: YAMNet
 
-Official references:
+The optional environment/nonverbal hearing path uses YAMNet locally in the browser through ONNX Runtime Web.
 
-- https://www.assemblyai.com/blog/universal-3-6-pro-realtime
-- https://www.assemblyai.com/blog/real-time-transcription-code-switches-multilingual-speakers
+YAMNet is useful here because it is small and fast enough for near-realtime browser inference:
+
+- 16 kHz mono waveform input;
+- roughly 0.96-second analysis windows;
+- 0.48-second hop / 50% overlap;
+- 521 AudioSet output classes;
+- a 1024-dimensional embedding is also available for deployments that later want a custom small classifier;
+- raw microphone audio does not need to be sent to a separate sound-classification API.
+
+Reference: <https://github.com/tensorflow/models/blob/master/research/audioset/yamnet/README.md>
+
+The public Hearing v2 catalog covers broad everyday sound groups such as music, rain, wind, water, doors, doorbells, footsteps, typing, pets, traffic, trains, aircraft, cooking, dishes, appliances, alarms, sirens, coughing, sneezing and laughter.
+
+The runtime separates **reactive** sounds from **ambient** sounds. A doorbell or cough may justify an immediate response; music, rain or typing should normally become context without repeatedly interrupting the conversation.
+
+YAMNet is still a general AudioSet classifier. Its published balanced mAP is about 0.306, so thresholds and labels should be treated as probabilistic hints rather than ground truth. Tune against your real device and room.
 
 ## Choosing your own stack
 
-Test transcript accuracy, turn-ending behavior, latency, billing model, credential exposure, fallback behavior, and regional/privacy requirements separately.
+Test these separately:
 
-A companion call is unusually sensitive to tiny speech-pipeline failures. Test with your real microphone, room, language mix, names, and one-word replies.
+- transcript accuracy;
+- short utterances;
+- conversational endpointing;
+- quiet speech;
+- latency;
+- code-switching;
+- background noise;
+- browser suspend/recovery;
+- billing model;
+- credential exposure;
+- regional/privacy requirements;
+- provider outages and fallback behavior.
+
+A companion call is unusually sensitive to small speech-pipeline failures. Benchmark with the actual phone, microphone, room and speaking style you expect to use.

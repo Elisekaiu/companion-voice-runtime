@@ -26,7 +26,11 @@ A recent voice turn can be repaired by immediate typed input. Companion Voice Ru
 
 Companion Voice Runtime can run more than one recognizer against the same microphone stream and arbitrate the result rather than binding the whole call to one provider.
 
-The current stack uses AssemblyAI as the main realtime STT path, with Tencent TRTC RealtimeTranscriber as an optional Chinese sidecar and ElevenLabs Scribe as an additional provider/fallback path. The turn layer also protects short acknowledgements and affectionate one-word utterances from being mistaken for interruptions while still allowing explicit stop commands to cut in immediately.
+For Chinese-first deployments, the reference guide now recommends trying **Tencent Cloud realtime speech recognition first**. Its realtime Chinese/RTC focus makes it a natural first benchmark for short, chat-like Mandarin utterances. This is a practical fit recommendation, **not** a claim that it uses the same recognition model as WeChat.
+
+AssemblyAI `universal-3-6-pro` remains a strong optional second path because it is built for realtime voice-agent speech, short utterances, noisy/phone audio, and multilingual code-switching. The runtime can run Tencent and AssemblyAI together and arbitrate one committed transcript; ElevenLabs Scribe remains an additional provider/fallback path. Dual recognition is optional rather than required.
+
+Provider-level `final` segments are no longer treated as the end of the user's thought. A turn buffer waits for conversational silence, merges late provider segments, deduplicates repeated finals, and commits only once. This reduces chopped turns when the speaker pauses briefly mid-sentence.
 
 ### Bounded autonomy
 
@@ -46,9 +50,11 @@ No private chat integration is shipped in this repository.
 
 Companion Voice Runtime can attach local perceptual cues to the exact assistant turn that consumed them.
 
-On-device workers can derive nonverbal audio events and prosodic facts such as level, approximate pitch, pitch variation, pauses, speaking rate, and ending trend. Only cues actually consumed by a response need to become part of that response's metadata. They can then survive into call history instead of vanishing as debug output.
+On-device workers can derive environmental/nonverbal audio events and prosodic facts such as level, approximate pitch, pitch variation, pauses, speaking rate, and ending trend. Hearing v2 uses YAMNet in the browser through ONNX Runtime Web. YAMNet scores **521 AudioSet classes** on roughly **0.96-second windows with 50% overlap**, which makes it useful for low-latency event cues without uploading raw microphone audio to a separate sound-classification service.
 
-The model is instructed to treat those cues as observations, not as proof of emotion, intent, comfort, or any other hidden state.
+The public hearing catalog expands beyond a handful of intimate/nonverbal cues to ordinary sounds such as music, rain, wind, footsteps, typing, doors, doorbells, pets, traffic, trains, aircraft, cooking, dishes, running water, appliances, alarms, sirens, coughing, sneezing, and laughter. Short salient events can be reactive; persistent ambience is remembered as context without repeatedly forcing the companion to speak.
+
+YAMNet is intentionally treated as a lightweight general audio classifier, not an oracle. Thresholds should be tuned for the actual device and room, and a detection is never treated as proof of emotion, intent, comfort, identity, or hidden physical state.
 
 ### Durable voice memories
 
@@ -58,11 +64,21 @@ The runtime persists transcript structure, call duration, assistant audio segmen
 
 ### Mobile recovery
 
-The browser client includes recovery paths for the things mobile Safari routinely interrupts: audio contexts, microphone tracks, STT connections, page visibility, and return-from-background behavior. A manual microphone reconnect path remains available when the OS wins.
+The browser client includes recovery paths for the things mobile Safari routinely interrupts: audio contexts, microphone tracks, STT connections, page visibility, and return-from-background behavior. It can also reconnect to an already-active call after a page reload/PWA restart, prevents a second overlapping active call from being created, and checks the server when the event stream disappears so stale call UI can close cleanly. A manual microphone reconnect path remains available when the OS wins.
 
 ### Idle STT sleep / wake
 
-Long calls can contain long stretches of real silence. The reference AssemblyAI path closes cloud STT after about 30 seconds without speech, keeps local microphone activity detection alive, retains roughly three seconds of pre-roll, and reconnects when speech returns. The Tencent sidecar sleeps and wakes with it. This avoids paying for an idle realtime session while preserving the feeling of staying on the call.
+Long calls can contain long stretches of real silence. The reference hybrid path now uses **light sleep** instead of putting every recognizer to sleep at once:
+
+- after about 30 seconds without speech, AssemblyAI can close its realtime session;
+- when Tencent is configured, Tencent stays online as the low-cost/low-friction wake path;
+- a Tencent transcript can wake AssemblyAI even when the speaker is too quiet for the local RMS gate;
+- the local speech gate remains only as a backup wake signal;
+- roughly three seconds of pre-roll are retained and sent to AssemblyAI after reconnect;
+- if Tencent is unavailable, the reference client does not automatically put AssemblyAI to sleep, preferring recognition reliability over the cost optimization;
+- manual mute still shuts the recognition paths down deliberately.
+
+This avoids making soft speech depend on a local volume threshold while still reducing idle AssemblyAI session time.
 
 ### Optional Usage Center
 
