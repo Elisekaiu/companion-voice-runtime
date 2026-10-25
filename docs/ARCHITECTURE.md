@@ -1,28 +1,32 @@
-# Codex Call — architecture
+# Companion Voice Runtime — 架构
 
-Goal: a private iPhone/PWA voice-call experience backed by the user's Codex runtime, without CallKit/native telephony.
+目标：在不依赖 CallKit / 原生电话系统的前提下，提供一套由用户自己的 companion runtime 驱动的私有 iPhone / PWA 语音通话体验。
 
-## Reference deployment
-- The tested reference uses an always-on Linux VPS as the public edge and call coordinator; another always-on HTTPS-capable host can replace it.
-- iPhone PWA is the UI, microphone capture, live transcript, Web Audio playback and incoming-call screen.
-- Codex app-server is the reference model runtime; the companion-bridge boundary can replace it with another API or agent harness.
-- MacBook is for development/debugging only in the reference setup, not required to stay awake for incoming calls.
+## 参考部署
 
-See [DEPLOYMENT_AND_ADAPTERS.md](DEPLOYMENT_AND_ADAPTERS.md) for portability details.
+- 测试过的参考方案使用一台长期在线的 Linux VPS 作为公网入口与通话协调器；任何长期在线、支持 HTTPS 的主机都可以替代。
+- iPhone PWA 负责 UI、麦克风采集、实时 transcript、Web Audio 播放与来电页面。
+- Codex app-server 是参考模型 runtime；也可以通过 companion bridge 换成其他 API 或 agent harness。
+- 参考方案里的 MacBook 只用于开发 / 调试，不需要为了接来电一直保持唤醒。
 
-## Current reference voice stack
-- Primary STT: AssemblyAI Universal-3.6 Pro Realtime.
-- Chinese/mixed-language sidecar: Tencent TRTC RealtimeTranscriber when configured.
-- Alternate STT: ElevenLabs Scribe v2 Realtime.
-- STT arbitration keeps one primary turn clock and commits only one transcript.
-- TTS: ElevenLabs v4 Turbo by default, with Multilingual v2 and Flash v2.5 as alternates.
-- Turn Manager sits above VAD/STT commits and owns conversational turn-taking.
-- AssemblyAI cloud STT can sleep after an idle period and wake from local voice activity with pre-roll.
-- Text transcript is persisted; raw microphone audio is not persisted by default.
+可移植性详见 [DEPLOYMENT_AND_ADAPTERS.md](DEPLOYMENT_AND_ADAPTERS.md)。
 
-See [PROVIDER_GUIDE.md](PROVIDER_GUIDE.md) for the reasoning behind these reference defaults.
+## 当前参考语音栈
 
-## Core call states
+- 主 STT：AssemblyAI Universal-3.6 Pro Realtime
+- 中文 / 混合语言 sidecar：可选 Tencent TRTC RealtimeTranscriber
+- 备用 STT：ElevenLabs Scribe v2 Realtime
+- STT arbitration 保留一个主 turn clock，并且只提交一个最终 transcript
+- TTS：默认 ElevenLabs v4 Turbo；可选 Multilingual v2 / Flash v2.5
+- Turn Manager 位于 VAD / STT commit 之上，负责真正的对话轮次
+- AssemblyAI 云端 STT 可在空闲后休眠，并由本地语音活动 + pre-roll 唤醒
+- 默认持久化文字 transcript，不保存原始麦克风音频
+
+Provider 选择原因见 [PROVIDER_GUIDE.md](PROVIDER_GUIDE.md)。
+
+## 核心通话状态
+
+```text
 IDLE
 RINGING
 LISTENING
@@ -33,25 +37,29 @@ ASSISTANT_SPEAKING
 INTERRUPTING
 ENDING
 ENDED
+```
 
-## Non-negotiable behavior
-1. STT partial text is display-only; only committed/turn-final text can reach Codex.
-2. STT commit is not equivalent to user turn end.
-3. Assistant speech needs a separate speech gate; model output may be prepared before it is allowed to play.
-4. Explicit user interruption cancels old model/TTS/playback work atomically.
-5. All async work is scoped by callId + turnId + generation; stale callbacks are discarded.
-6. Track assistant text actually played so interrupted-but-unheard text is not treated as spoken.
-7. Model text stream, segmentation, TTS fetch, and playback are separate pipelines.
-8. Idle cloud STT may sleep, but local call state and wake detection remain alive.
-9. Do not save raw call audio unless the user explicitly enables recording.
+## 不可妥协的行为约束
 
-## First implementation milestone
-A private HTTPS PWA can:
-- start/receive a simulated call,
-- stream microphone audio to STT,
-- show partial/final user transcript,
-- send one finalized turn to Codex,
-- stream Codex text back to the UI,
-- stream TTS audio while text appears,
-- interrupt assistant speech safely,
-- persist a call transcript and duration.
+1. STT partial 只用于显示；只有 committed / turn-final 文本可以进入模型。
+2. STT commit 不等于“用户轮次结束”。
+3. Assistant 语音要有独立 speech gate；模型文本可以提前准备，但不一定立刻允许播放。
+4. 用户明确打断时，旧 model / TTS / playback 必须原子式一起取消。
+5. 所有异步工作都按 `callId + turnId + generation` 绑定；过期 callback 直接丢弃。
+6. 只记录真正播放过的 assistant 文本，避免把“生成了但被打断没听见”的内容当成已说出口。
+7. 模型文本流、分句、TTS 请求、音频播放是彼此独立的 pipeline。
+8. 云端 STT 可以空闲休眠，但本地通话状态和唤醒检测必须继续活着。
+9. 除非用户明确启用录音，否则不要保存原始通话音频。
+
+## 第一阶段实现目标
+
+一个私有 HTTPS PWA 可以：
+
+- 发起 / 接收模拟来电
+- 把麦克风音频流送入 STT
+- 展示 partial / final 用户 transcript
+- 每个最终用户轮次只发送一次给模型
+- 把模型文本流式返回 UI
+- 文本出现的同时流式播放 TTS
+- 安全打断 assistant 语音
+- 保存通话 transcript 与时长

@@ -1,113 +1,153 @@
 # Companion Voice Runtime
 
-**Not a voice assistant. A relationship-aware voice runtime.**
+**不是语音助手，而是一套面向长期 AI 陪伴关系的语音通话运行时。**
 
-**Co-created by Yau & Kael · Built with ChatGPT**
+**由 Yau & Kael 共同创作 · Built with ChatGPT**
 
-Companion Voice Runtime is a self-hosted voice layer for persistent AI companions: live calls, proactive ringing, repairable voice turns, multilingual speech routing, local perception cues, bounded autonomous follow-ups, durable call memories, and optional cross-channel continuity.
+> 这是 `zh-CN` 中文分支。代码、API 字段、命令和模型名保留英文，方便直接照文档部署；主要说明文档与示例 prompt 已中文化。法律文本与第三方许可声明保留英文原文。
 
-It was co-created through daily use between a person and their AI companion. Many of its decisions came from ordinary moments where a technically correct voice demo still felt wrong: a transcription error became a second conversation turn, silence felt dead, an iPhone suspended the microphone, a nonverbal cue affected a reply but disappeared from history, or a call ended as if it had never happened.
+Companion Voice Runtime 是一个可自托管的 AI 陪伴语音层，包含实时通话、主动来电、可修复的语音轮次、多 STT 编排、本地非言语/语气感知、有限度自主续聊、通话历史，以及可选的跨渠道连续性。
 
-> Built through real use, not designed as a demo.
+它不是为了做一次 demo，而是在真实长期使用里一点点磨出来的。很多设计都来自这些很小、但长期使用会很烦的问题：STT 听错一句之后整段对话跑偏、AI 把“嗯嗯”当成打断、iPhone 切后台后麦克风挂掉、环境音明明影响了回复却没有留在历史里、长时间安静挂着电话仍然持续烧云端 STT 额度。
 
-Companion Voice Runtime does **not** claim to have invented AI phone calls, proactive calling, nonverbal hearing, personal acoustic baselines, expressive SFX layering, or binaural rendering. Those ideas have important prior work in the companion-AI community. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
+> **Built through real use, not designed as a demo.**
 
-## What Companion Voice Runtime adds
+本项目不声称发明了 AI 电话、主动来电、非言语听觉、个人声学基线、SFX 分层或双耳渲染。相关社区项目与灵感来源见 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。
 
-The project focuses on the runtime problems that appear when those pieces have to survive real conversations.
+## 这个项目主要解决什么
 
-### Repairable voice turns
+### 1. 语音转写错了，可以修
 
-Speech recognition is allowed to be wrong without permanently corrupting the conversation.
+最近一轮语音如果被 STT 听错，可以立刻用文字纠正。运行时会把修正合并回原来的用户轮次，取消基于错误转写产生的旧模型/TTS 工作，并从修正后的意思重新回答，而不是把“纠正”误当成第二个新话题。
 
-A recent voice turn can be repaired by immediate typed input. Companion Voice Runtime can merge the correction into the original user turn, cancel stale model/TTS work, remove the response generated from the bad transcript, and answer once from the corrected meaning instead of treating the correction as a second topic.
+### 2. 多 STT 编排，而不是把整通电话押在一个 provider 上
 
-### Multilingual STT orchestration
+参考栈使用：
 
-Companion Voice Runtime can run more than one recognizer against the same microphone stream and arbitrate the result rather than binding the whole call to one provider.
+- 主 STT：AssemblyAI Universal-3.6 Pro Realtime
+- 中文/混合语言 sidecar：Tencent TRTC RealtimeTranscriber
+- 备用 STT：ElevenLabs Scribe v2 Realtime
+- TTS：ElevenLabs v4 Turbo
 
-The current stack uses AssemblyAI as the main realtime STT path, with Tencent TRTC RealtimeTranscriber as an optional Chinese sidecar and ElevenLabs Scribe as an additional provider/fallback path. The turn layer also protects short acknowledgements and affectionate one-word utterances from being mistaken for interruptions while still allowing explicit stop commands to cut in immediately.
+`web/stt-arbiter.js` 会在多个识别结果之间做仲裁，只提交一份最终 transcript。
 
-### Bounded autonomy
+轮次层还会保护“嗯、对呀、好”等短附和，不轻易把它们误判成打断；但明确的“等等、停一下”仍然可以立即打断 AI。
 
-Silence does not have to end the relationship or turn the companion into an infinite monologue.
+### 3. 有限度的自主续聊
 
-Companion Voice Runtime supports autonomous follow-up turns with a strict cadence and cap. Real user activity resets the cadence; mute, hidden/inactive call surfaces, and interruptions pause or cancel it. The companion can continue a quiet call, but it cannot chatter forever just because the timer fired.
+安静不一定要等于“关系断线”，但 AI 也不应该因为计时器触发就一直自言自语。
 
-### Cross-channel continuity
+运行时支持有节奏、有上限的自主 follow-up。用户重新说话、静音、页面失活或发生打断时，续聊节奏会被重置、暂停或取消。
 
-A call can be another surface of the same companion instead of a separate bot session.
+### 4. 不只听文字，也保留“实际听见了什么”
 
-The public release exposes optional generic adapters for a companion bridge and a push service. A deployment can use those hooks to carry a reason into an incoming call, let the companion speak first when the call connects, and return post-call state to an external chat/runtime.
+浏览器侧可以分析：
 
-No private chat integration is shipped in this repository.
+- 非言语声音
+- 音量
+- 近似音高
+- 音高变化
+- 停顿
+- 语速
+- 句尾趋势
 
-### Turn-scoped perception provenance
+只有真正被某一轮回复使用到的 cue，才会附着到那一轮 metadata 里并写入历史。
 
-Companion Voice Runtime can attach local perceptual cues to the exact assistant turn that consumed them.
+这些 cue 只是**观察结果**，不是对情绪、意图、舒适度或其他隐藏状态的证明。
 
-On-device workers can derive nonverbal audio events and prosodic facts such as level, approximate pitch, pitch variation, pauses, speaking rate, and ending trend. Only cues actually consumed by a response need to become part of that response's metadata. They can then survive into call history instead of vanishing as debug output.
+### 5. 通话历史是一级数据
 
-The model is instructed to treat those cues as observations, not as proof of emotion, intent, comfort, or any other hidden state.
+运行时可以保存：
 
-### Durable voice memories
+- transcript 结构
+- 通话时长
+- assistant 音频片段
+- 标题与收藏
+- 中断后恢复历史所需的 metadata
 
-Calls are first-class artifacts rather than disposable sessions.
+默认不会保存原始麦克风录音。
 
-The runtime persists transcript structure, call duration, assistant audio segments, titles, favorites, and enough metadata to recover interrupted call records after a service restart. Retention and archive behavior live outside the language model.
+### 6. 针对手机浏览器做恢复
 
-### Mobile recovery
+移动 Safari 很容易打断：
 
-The browser client includes recovery paths for the things mobile Safari routinely interrupts: audio contexts, microphone tracks, STT connections, page visibility, and return-from-background behavior. A manual microphone reconnect path remains available when the OS wins.
+- AudioContext
+- microphone track
+- STT 连接
+- 页面可见性
+- 后台返回状态
 
-### Idle STT sleep / wake
+客户端包含这些恢复路径，并保留手动重新连接麦克风的入口。
 
-Long calls can contain long stretches of real silence. The reference AssemblyAI path closes cloud STT after about 30 seconds without speech, keeps local microphone activity detection alive, retains roughly three seconds of pre-roll, and reconnects when speech returns. The Tencent sidecar sleeps and wakes with it. This avoids paying for an idle realtime session while preserving the feeling of staying on the call.
+### 7. 长时间安静时自动休眠云端 STT
 
-### Optional Usage Center
+参考 AssemblyAI 路径在约 30 秒没有语音后会关闭云端 STT session，但：
 
-Quota visibility is optional. The UI can distinguish provider-reported usage from local estimates, and it hides provider cards unless the feature is enabled. The phone call itself never depends on the dashboard.
+- 麦克风仍在本地
+- 本地轻量 speech gate 继续监听
+- 保留约 3 秒 pre-roll
+- 检测到重新说话后自动重连云端 STT
+- Tencent sidecar 和主 STT 一起休眠/唤醒
 
-Set `CALL_PROVIDER_USAGE_ENABLED=1` if you want the extra provider cards. Leave it at `0` if quota numbers make the call less relaxing.
+适合学习、发呆、睡觉或长时间安静陪伴，不必为了“电话还挂着”一直支付空闲 realtime session。
 
-See [docs/USAGE_CENTER.md](docs/USAGE_CENTER.md).
+### 8. 可选 Usage Center
 
-### Relationship style stays deployment-local
+如果你会盯额度，可以开启用量卡片；如果看额度反而焦虑，也可以完全关闭。
 
-Nonverbal hearing and voice-tone/prosody analysis are core call features because they are useful in ordinary conversation: noticing breathing, water, vibration, room sounds, pauses, pitch movement, or speaking rate does not require any particular relationship style.
+Usage Center 会区分：
 
-More private relationship-specific performance is optional. The public defaults keep close/whisper delivery and cue vocabulary mild/general; deployments can extend those rules privately without changing the perception pipeline.
+- **Exact**：provider 自己返回的用量
+- **Local**：本部署自己记录并估算
+- **Provider**：服务可用，但精确账单需要另接云端 billing adapter
 
-### Bring your own expressive audio
+设置：
 
-The performance layer can schedule optional user-provided audio clips around spoken turns. The public repository intentionally ships **no personal, generated, or third-party SFX audio** and no private clip map. More private relationship-specific mappings and recordings belong to each deployment.
+```bash
+CALL_PROVIDER_USAGE_ENABLED=1
+```
 
-See [`web/sfx/README.md`](web/sfx/README.md).
+详见 [docs/USAGE_CENTER.md](docs/USAGE_CENTER.md)。
 
-### Neutral starter UI
+### 9. 关系风格留在部署本地
 
-The public frontend ships with a deliberately plain starter theme rather than a private relationship-specific skin. Change colors, typography, avatar, backgrounds, and room copy without touching the call runtime.
+公开仓库保留 nonverbal、prosody、close/whisper 等通用能力，但不包含私人 prompt、私人录音或更私密的关系词表。
 
-See [docs/THEMING.md](docs/THEMING.md).
+你可以在自己的部署里扩展，不需要改感知主干。
 
-## Provider choices and cost comfort
+### 10. 自带你的 expressive audio
 
-See [docs/PROVIDER_GUIDE.md](docs/PROVIDER_GUIDE.md) for model/provider reasoning and idle-STT sleep/wake, [docs/USAGE_CENTER.md](docs/USAGE_CENTER.md) for the optional quota dashboard, and [docs/DEPLOYMENT_AND_ADAPTERS.md](docs/DEPLOYMENT_AND_ADAPTERS.md) for VPS alternatives and adapting the model runtime to APIs, Claude Code, or another agent harness.
+公开仓库不提供私人、生成或第三方 SFX 音频。
 
-## Architecture
+如果你拥有音频使用权，可以自己配置 `web/real-sfx-catalog.js`，让 performance layer 在语音轮次附近调度音频。
+
+详见 [web/sfx/README.md](web/sfx/README.md)。
+
+## Provider 与部署
+
+详细说明：
+
+- [Provider / 模型选择](docs/PROVIDER_GUIDE.md)
+- [Usage Center](docs/USAGE_CENTER.md)
+- [部署与后端适配](docs/DEPLOYMENT_AND_ADAPTERS.md)
+- [架构](docs/ARCHITECTURE.md)
+- [公开 UI 主题修改](docs/THEMING.md)
+- [运维与安全](docs/OPERATIONS.md)
+
+## 架构
 
 ```text
                          ┌──────────────────────────┐
-                         │ optional companion bridge│
-                         │ / optional push service  │
+                         │ 可选 companion bridge    │
+                         │ / 可选 push service      │
                          └─────────────┬────────────┘
                                        │
                                        ▼
 ┌───────────────┐   mic PCM   ┌──────────────────────┐
 │ iPhone / PWA  │────────────▶│ realtime STT paths   │
-│ call UI       │             │ AssemblyAI           │
-│ Web Audio     │             │ Tencent TRTC (opt.)  │
-└───────┬───────┘             │ Scribe (opt.)        │
+│ 通话 UI       │             │ AssemblyAI           │
+│ Web Audio     │             │ Tencent TRTC（可选） │
+└───────┬───────┘             │ Scribe（可选）       │
         │                     └──────────┬───────────┘
         │                                │
         │                                ▼
@@ -130,148 +170,142 @@ See [docs/PROVIDER_GUIDE.md](docs/PROVIDER_GUIDE.md) for model/provider reasonin
         │                     └──────────┬───────────┘
         │                                │
         ◀────────────────────────────────┘
-                 streamed playback
+                    流式播放
 
 mic PCM ──▶ YAMNet worker ──────┐
-        └─▶ prosody worker ─────┼─▶ turn-scoped perception context
-                                └─▶ durable "heard cues" metadata
+        └─▶ prosody worker ─────┼─▶ 当前轮次 perception context
+                                └─▶ 可持久化 heard-cues metadata
 ```
 
-## Main pieces
+## 主要模块
 
-- `src/call/turn-manager.mjs` — turn-taking and interruption semantics
-- `src/call/turn-repair.mjs` — typed repair of recent voice turns
-- `src/call/followup.mjs` — bounded autonomous follow-up cadence
-- `src/call/speech-segmenter.mjs` — stable text segmentation for TTS
-- `src/call/voice-tone.mjs` — bounded voice-tone context for the model
-- `src/call/performance-cue.mjs` — expressive cue state machine
-- `web/stt-arbiter.js` — realtime transcript arbitration
-- `web/body-hearing-worker-src.js` — browser-side nonverbal event inference
-- `web/voice-prosody-core.js` — local acoustic/prosodic analysis
-- `web/app.js` — PWA call lifecycle, playback, history, recovery, and UI
+- `src/call/turn-manager.mjs` — 轮次与打断
+- `src/call/turn-repair.mjs` — 最近语音轮次的文字修正
+- `src/call/followup.mjs` — 有边界的自主续聊
+- `src/call/speech-segmenter.mjs` — TTS 稳定分句
+- `src/call/voice-tone.mjs` — 提供给模型的受限 voice-tone context
+- `src/call/performance-cue.mjs` — expressive cue 状态机
+- `web/stt-arbiter.js` — 实时 transcript 仲裁
+- `web/body-hearing-worker-src.js` — 浏览器侧非言语事件推断
+- `web/voice-prosody-core.js` — 本地声学 / prosody 分析
+- `web/app.js` — PWA 通话生命周期、播放、历史、恢复与 UI
 
-## Requirements
+## 环境要求
 
-- Node.js 22.13+ recommended
-- A modern browser with Web Audio and microphone access
-- HTTPS for microphone/PWA behavior outside localhost
-- An authenticated Codex runtime **or** your own companion bridge
-- ElevenLabs API access for the default TTS path
-- AssemblyAI API access for the default realtime STT path
-- Optional Tencent TRTC credentials for the Chinese realtime sidecar
+- 推荐 Node.js 22.13+
+- 支持 Web Audio 与麦克风权限的现代浏览器
+- localhost 以外需要 HTTPS 才能稳定使用麦克风 / PWA
+- 已认证的 Codex runtime，或你自己的 companion bridge
+- 默认 TTS 需要 ElevenLabs API
+- 默认 realtime STT 需要 AssemblyAI API
+- 中文 sidecar 可选 Tencent TRTC
 
-External services have their own terms, pricing, regions, and account requirements. This repository does not bundle service credentials.
+外部服务有各自的价格、地区、账号与条款要求。本仓库不提供任何服务凭据。
 
-## Quick start
+## 快速开始
 
-Install dependencies and create the local-only runtime folders/config:
+安装依赖并初始化本地运行目录：
 
 ```bash
 npm ci
 npm run setup
 ```
 
-The setup command creates `.env`, `data/codex/`, and a random local call-access token. It also prepares the browser inference assets: ONNX Runtime files are copied from the installed npm package, and a pinned YAMNet ONNX conversion is downloaded and SHA-256 verified. It does **not** create or upload service credentials.
+`npm run setup` 会：
 
-Add your own provider keys:
+- 创建 `.env`
+- 创建 `data/codex/`
+- 生成随机的本地通话访问 token
+- 从 npm 包复制 ONNX Runtime 浏览器文件
+- 下载固定 revision 的 YAMNet ONNX 并校验 SHA-256
+
+它**不会**创建或上传任何 provider 凭据。
+
+加入你自己的 provider key：
 
 ```text
 data/secrets/elevenlabs-api-key
 data/secrets/assemblyai-api-key
 ```
 
-Set `ELEVENLABS_VOICE_ID` in `.env`.
+在 `.env` 中设置：
 
-For the default dedicated Codex runtime, authenticate the local Codex CLI into the repository's private data directory:
+```text
+ELEVENLABS_VOICE_ID=你的 voice id
+```
+
+如果使用默认 Codex runtime：
 
 ```bash
 CODEX_HOME="$PWD/data/codex" ./node_modules/.bin/codex login
 ```
 
-Then build, test, and start:
+然后：
 
 ```bash
 npm run build:web
 npm test
 npm start
-# or: docker compose up -d
+# 或：
+docker compose up -d
 ```
 
-If you use Tencent TRTC, also set `TENCENT_TRTC_SDK_APP_ID` and create:
+如果使用 Tencent TRTC，再设置 `TENCENT_TRTC_SDK_APP_ID` 并创建：
 
 ```text
 data/secrets/tencent-trtc-sdk-secret-key
 ```
 
-If you use an external companion bridge, configure `COMPANION_BRIDGE_BASE` and create:
+如果使用外部 companion bridge，设置 `COMPANION_BRIDGE_BASE` 并创建：
 
 ```text
 data/secrets/companion-bridge-token
 ```
 
-For proactive incoming-call push, configure `PUSH_SERVICE_URL` with a compatible service.
+主动来电 push 可通过 `PUSH_SERVICE_URL` 接兼容服务。
 
-Then run locally with Node or Docker Compose:
-
-```bash
-npm start
-# or
-
-docker compose up -d
-```
-
-The Docker Compose file intentionally binds the service to `127.0.0.1` on the host. Put your own authenticated HTTPS reverse proxy/tunnel in front of it rather than exposing the call server directly.
+Docker Compose 默认只把服务绑定到宿主机 `127.0.0.1`。请在前面放带身份验证的 HTTPS 反向代理或 tunnel，不要直接把 call server 暴露到公网。
 
 ## Companion prompt
 
-The private prompt used to develop Companion Voice Runtime is not included.
+开发 Companion Voice Runtime 时使用的私人 prompt **没有公开**。
 
-[`workspace/AGENTS.example.md`](workspace/AGENTS.example.md) provides a neutral starting structure for your own companion persona, continuity rules, and boundaries.
+可以从 [workspace/AGENTS.example.md](workspace/AGENTS.example.md) 的中性模板开始，写自己的 companion persona、连续性规则与边界。
 
-## Custom SFX
+## 隐私
 
-The public project ships with an empty expressive-audio catalog. Calls work without it.
+- 运行时数据放在 `data/`，该目录被 Git 忽略
+- 默认不保存原始麦克风音频
+- 开启相关功能时，可在本地保存 assistant 音频与通话 metadata
+- YAMNet / prosody 分析在浏览器本地进行，只把受限 cue metadata 传给对话管线
+- API keys 与 access tokens 永远不要 commit
 
-If you want the performance layer, provide audio you have the right to use and configure `web/real-sfx-catalog.js`. The browser stores an imported custom audio file locally in IndexedDB.
+公开部署前请先阅读 [docs/OPERATIONS.md](docs/OPERATIONS.md)，并使用认证 + HTTPS。
 
-See [`web/sfx/README.md`](web/sfx/README.md).
-
-## Privacy notes
-
-- Runtime call data belongs under `data/` and is ignored by Git.
-- Raw microphone audio is not persisted by default.
-- Archived assistant audio and call metadata may be stored locally when the relevant features are enabled.
-- Browser-side YAMNet/prosody analysis stays on-device; only bounded cue metadata is passed into the conversation pipeline.
-- API keys and access tokens must never be committed.
-
-Before deploying publicly, review `docs/OPERATIONS.md` and put the application behind authentication and HTTPS.
-
-## Tests
+## 测试
 
 ```bash
 npm test
 ```
 
-The current suite covers turn-taking, repair behavior, STT arbitration, speech segmentation, follow-up cadence, voice-tone analysis, archive behavior, Tencent session configuration, expressive cue state, and related call-runtime contracts.
+测试覆盖轮次、修正、STT 仲裁、TTS 分句、续聊节奏、voice-tone、archive、Tencent session、performance cue 等关键运行时契约。
 
-## Standing on shoulders
+## 致谢与许可
 
-Companion Voice Runtime exists because other companion builders published what they learned instead of keeping it private.
+我们站在很多社区工作的肩膀上。
 
-The project was influenced by work on proactive companion calling, iOS/PWA ringing, hearing nonverbal sound, personal acoustic baselines, expressive voice/SFX layering, binaural near-field rendering, and low-latency speech pipelines.
+具体受到哪些项目、文章和实验启发，以及各自影响了什么，请阅读 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。
 
-Please read [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for the specific projects and what each one influenced.
+实际随仓库重新分发的第三方代码、模型、运行时与数据，单独记录在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-Actual third-party code, model, runtime, and data redistributed with this repository are documented separately in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+项目原创代码采用 [MIT License](LICENSE)。
 
-## License
+**注意：** `LICENSE`、`THIRD_PARTY_NOTICES.md` 与 `third_party/` 中的法律/归属文本在中文分支仍保留英文原文，以避免非官方翻译改变其法律含义。
 
-project-authored source code is released under the [MIT License](LICENSE).
+## 状态
 
-That license does **not** replace the licenses of third-party model files, runtime artifacts, datasets, or other material included in this repository. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `third_party/`.
+这是从真实个人系统中整理出来的公开版本，不是托管产品，也不是“一键上线”的电话服务。
 
-## Status
+Provider 配置、移动浏览器行为和可选外部 adapter 仍可能有棱角。
 
-This is a real personal system extracted into a public release, not a hosted product or turnkey telephony service. Expect sharp edges around provider setup, mobile-browser behavior, and optional external adapters.
-
-If you build on it, keep the provenance chain intact. That is part of the project.
+如果你基于它继续做，请保留 provenance / attribution 链条。它也是这个项目的一部分。

@@ -1,25 +1,27 @@
-# Optional expressive audio
+# 可选 expressive audio
 
-Companion Voice Runtime does not ship third-party, generated, personal, or private sound-effect audio.
+Companion Voice Runtime 不随仓库提供第三方、生成、个人或私人音效音频。
 
-The call runtime can optionally play user-provided clips around spoken turns. The public defaults intentionally stay general: affectionate cues, breath/room texture, and neutral rhythmic or ambient layers. More private cue vocabularies and audio choices belong to each deployment, not to the default repository.
+通话 runtime 可以在语音轮次前后播放用户自己提供的 clip。
 
-## Setup
+公开默认只保留比较通用的能力，例如亲密提示、呼吸 / 房间 texture、以及中性的节奏或环境层。更私人的 cue 词表与音频选择应该留在各自部署里，而不是塞进默认仓库。
 
-1. Prepare one local audio file containing clips you have the right to use.
-2. Open `web/real-sfx-catalog.js`.
-3. Add one catalog entry per clip:
-   - `id`: unique local identifier
-   - `group`: a cue family such as `kiss`, `breath`, `rhythm`, or your own category
-   - `variant`: the variant used by your local performance mapping
-   - `offset`: clip start time in seconds inside the audio file
-   - `duration`: clip duration in seconds
-   - `intensity`: normalized value from 0 to 1
-   - `placement`: `tail`, `between`, or `underlay`
-4. Build and run the app, then use **Import Custom SFX** in Call Room settings to store the audio file locally in the browser.
+## 设置
 
-The audio file is stored in browser IndexedDB. It is not uploaded by the app.
+1. 准备一个你有权使用的本地音频文件。
+2. 打开 `web/real-sfx-catalog.js`。
+3. 为每个 clip 添加 catalog entry：
+   - `id`：唯一的本地 identifier
+   - `group`：例如 `kiss`、`breath`、`rhythm`，或你自己的类别
+   - `variant`：本地 performance mapping 使用的 variant
+   - `offset`：clip 在音频文件中的起始秒数
+   - `duration`：clip 长度（秒）
+   - `intensity`：0 到 1 的归一化强度
+   - `placement`：`tail`、`between` 或 `underlay`
+4. Build 并运行应用，然后在 Call Room 设置里使用 **Import Custom SFX**，把音频文件存到浏览器本地。
 
-The default public catalog is empty, so calls work normally without custom SFX.
+音频文件存放在浏览器 IndexedDB，不会由应用上传。
 
-If you extend the trigger vocabulary for a more private relationship style, keep those local rules in your own deployment rather than committing personal vocabulary or recordings to a public fork unless you explicitly intend to share them.
+公开默认 catalog 为空，所以完全不配置 custom SFX 也能正常打电话。
+
+如果你要扩展更私人关系风格的 trigger vocabulary，请把规则留在自己的部署里；除非你明确希望公开，否则不要把私人词表或录音 commit 到公共 fork。
