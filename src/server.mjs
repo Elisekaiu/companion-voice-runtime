@@ -17,6 +17,7 @@ import { FollowupState } from './call/followup.mjs';
 import { isVoiceReason, shouldRepairTyped, mergeRepairText, repairContext } from './call/turn-repair.mjs';
 import { CodexAppServer } from './codex/app-server.mjs';
 import { createProviderUsage } from './provider-usage.mjs';
+import { HEARING_LABELS, REACTIVE_HEARING_KEYS } from '../web/hearing-catalog.js';
 
 const HOST=process.env.CALL_HOST||'0.0.0.0';
 const PORT=Number(process.env.CALL_PORT||8840);
@@ -108,6 +109,10 @@ function cookie(req,name){
   const item=String(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith(name+'='));
   return item?decodeURIComponent(item.slice(name.length+1)):'';
 }
+const SESSION_MAX_AGE=365*24*60*60;
+function sessionCookie(){
+  return 'codex_call_session='+encodeURIComponent(ACCESS_TOKEN)+'; Path=/call; HttpOnly; Secure; SameSite=Strict; Max-Age='+SESSION_MAX_AGE;
+}
 function authorized(req){return !!ACCESS_TOKEN&&equalSecret(cookie(req,'codex_call_session'),ACCESS_TOKEN);}
 function authorizedVoiceBridge(req){const value=String(req.headers.authorization||'');return value.startsWith('Bearer ')&&!!COMPANION_BRIDGE_TOKEN&&equalSecret(value.slice(7),COMPANION_BRIDGE_TOKEN);}
 function sendJson(res,status,body,headers={}){
@@ -121,6 +126,9 @@ async function readJson(req){
 }
 function publicCall(call){
   return {id:call.id,state:call.state,direction:call.direction,ttsTone:call.ttsTone,voiceProfile:call.intimacy?.active?'intimate':'normal',createdAt:call.createdAt,startedAt:call.startedAt,endedAt:call.endedAt,ringExpiresAt:call.ringExpiresAt||null,ringReason:call.ringReason||null,generation:call.generation,turnId:call.turnId,ttsModel:call.ttsModel,transcript:call.transcript};
+}
+function currentActiveCall(){
+  return [...calls.values()].filter(call=>!call.endedAt&&call.state!=='ENDED').sort((a,b)=>Date.parse(b.startedAt||b.createdAt||0)-Date.parse(a.startedAt||a.createdAt||0))[0]||null;
 }
 function callDurationMs(call){
   if(!call.startedAt)return null;
@@ -215,7 +223,7 @@ function deleteCallArchive(id){
   fs.rmSync(file+'.tmp',{force:true});fs.rmSync(file,{force:true});
 }
 function createCall(direction='outgoing',ttsModel=TTS_MODEL,ttsTone='original'){
-  const call={id:randomUUID(),direction,ttsModel,ttsTone,state:'RINGING',createdAt:new Date().toISOString(),startedAt:null,endedAt:null,generation:0,turnId:0,codexThreadId:null,title:null,transcript:[],audioSegments:[],events:[],nextEventId:0,subscribers:new Set(),segments:new Map(),turnManager:new TurnManager(),intimacy:new IntimacyState(),followupState:new FollowupState(),followupTimer:null,lastVoiceInput:null,pendingRepair:null,finalizeTimer:null,activeAbort:null,activeCodexTurnId:null,activeInputReason:null,performanceState:new PerformanceState(),performanceCues:new Map(),performanceCueSent:new Set(),nonverbalLastSeen:Object.create(null),nonverbalPendingKeys:new Set(),pendingNonverbalDetails:[],nonverbalFlushTimer:null,pendingVoiceTone:null,ringExpiresAt:null,ringReason:null,ringTimer:null,postCallDeliveryPending:false,postCallNotifyReason:null,postCallNotifiedAt:null};
+  const call={id:randomUUID(),direction,ttsModel,ttsTone,state:'RINGING',createdAt:new Date().toISOString(),startedAt:null,endedAt:null,generation:0,turnId:0,codexThreadId:null,title:null,transcript:[],audioSegments:[],events:[],nextEventId:0,subscribers:new Set(),segments:new Map(),turnManager:new TurnManager(),intimacy:new IntimacyState(),followupState:new FollowupState(),followupTimer:null,lastVoiceInput:null,pendingRepair:null,finalizeTimer:null,activeAbort:null,activeCodexTurnId:null,activeInputReason:null,performanceState:new PerformanceState(),performanceCues:new Map(),performanceCueSent:new Set(),nonverbalLastSeen:Object.create(null),nonverbalPendingKeys:new Set(),pendingNonverbalDetails:[],nonverbalFlushTimer:null,pendingVoiceTone:null,pendingSttProvider:null,pendingSttCandidates:null,ringExpiresAt:null,ringReason:null,ringTimer:null,postCallDeliveryPending:false,postCallNotifyReason:null,postCallNotifiedAt:null};
   calls.set(call.id,call);storage.save(call);return call;
 }
 function incomingTone(){
@@ -292,9 +300,7 @@ function scheduleFollowup(call){
   call.followupTimer.unref?.();
   return true;
 }
-const NONVERBAL_LABELS=Object.freeze({
-  vocalization:'持续人声',breathing:'呼吸声',gasp:'急促吸气',vibration:'震动声',water:'水声',wet:'液体/摩擦声',slap:'拍击声'
-});
+const NONVERBAL_LABELS=HEARING_LABELS;
 const NONVERBAL_SERVER_COOLDOWN_MS=8000;
 function scheduleNonverbalFlush(call,delay=1200){
   clearTimeout(call.nonverbalFlushTimer);
@@ -307,23 +313,25 @@ function scheduleNonverbalFlush(call,delay=1200){
   call.nonverbalFlushTimer.unref?.();
 }
 function noteNonverbalDetection(call,{key,score=0,continued=false}={}){
-  const label=NONVERBAL_LABELS[String(key||'')];
+  key=String(key||'');
+  const label=NONVERBAL_LABELS[key];
   if(!label)return {accepted:false,error:'unknown_nonverbal'};
   if(call.state==='RINGING'||call.state==='ENDED'||call.endedAt)return {accepted:false,error:'call_not_active'};
-  const now=Date.now(),last=Number(call.nonverbalLastSeen[key]||0);
-  if(now-last<NONVERBAL_SERVER_COOLDOWN_MS)return {accepted:false,deduped:true,label};
-  if(call.nonverbalPendingKeys.size>=2&&!call.nonverbalPendingKeys.has(key))return {accepted:false,limited:true,label};
+  const now=Date.now(),last=Number(call.nonverbalLastSeen[key]||0),reactive=REACTIVE_HEARING_KEYS.has(key);
+  if(now-last<NONVERBAL_SERVER_COOLDOWN_MS)return {accepted:false,deduped:true,label,reactive};
+  if(call.nonverbalPendingKeys.size>=4&&!call.nonverbalPendingKeys.has(key))return {accepted:false,limited:true,label,reactive};
   call.nonverbalLastSeen[key]=now;
-  noteFollowupUserActivity(call,now);
+  if(reactive)noteFollowupUserActivity(call,now);
   call.nonverbalPendingKeys.add(key);
   call.intimacy.noteNonverbal(label+(continued?'，还在继续':''));
   const safeScore=Math.max(0,Math.min(1,Number(score)||0));
-  call.pendingNonverbalDetails.push({key:String(key),label,score:Number(safeScore.toFixed(3)),continued:!!continued,at:new Date(now).toISOString()});
-  if(call.pendingNonverbalDetails.length>8)call.pendingNonverbalDetails.splice(0,call.pendingNonverbalDetails.length-8);
-  event(call,'nonverbal_heard',{key,label,score:Number(safeScore.toFixed(3)),continued:!!continued});
-  scheduleNonverbalFlush(call);
-  return {accepted:true,label};
+  call.pendingNonverbalDetails.push({key,label,score:Number(safeScore.toFixed(3)),continued:!!continued,reactive,at:new Date(now).toISOString()});
+  if(call.pendingNonverbalDetails.length>12)call.pendingNonverbalDetails.splice(0,call.pendingNonverbalDetails.length-12);
+  event(call,'nonverbal_heard',{key,label,score:Number(safeScore.toFixed(3)),continued:!!continued,reactive});
+  if(reactive)scheduleNonverbalFlush(call);else storage.save(call);
+  return {accepted:true,label,reactive};
 }
+
 function buildHeardCues(heardDetails=[],toneDescription=null){
   const nonverbals=(Array.isArray(heardDetails)?heardDetails:[]).slice(0,4).map(item=>({
     key:String(item?.key||''),
@@ -497,9 +505,10 @@ async function processTurn(call,text,reason){
   call.activeInputReason=reason;
   const transition=(nonverbalOnly||incomingOpening||autonomousFollowup)?{active:call.intimacy.active,changed:false}:call.intimacy.observeUser(text);
   if(transition.changed)event(call,'voice_profile',{profile:transition.active?'intimate':'normal'});
-  const heard=call.intimacy.consumeNonverbals();
+  const consumeHeard=!(incomingOpening||autonomousFollowup);
+  const heard=consumeHeard?call.intimacy.consumeNonverbals():[];
   const heardDetails=heard.length?(call.pendingNonverbalDetails||[]).splice(0):[];
-  call.nonverbalPendingKeys.clear();
+  if(heard.length)call.nonverbalPendingKeys.clear();
   const voiceTone=(nonverbalOnly||incomingOpening||autonomousFollowup||typedRepair)?null:call.pendingVoiceTone;
   if(!nonverbalOnly)call.pendingVoiceTone=null;
   const cueText=incomingOpening?String(call.ringReason||''):(autonomousFollowup?'':text);
@@ -548,7 +557,8 @@ async function processTurn(call,text,reason){
     call.transcript.push({id:randomUUID(),speaker:'system',type:'typed_repair',turnId,text:String(repair?.typedText||''),reason,at:new Date().toISOString(),repairOfTurnId:repair?.priorTurnId||null});
     storage.save(call);
   }else{
-    const userEntry={id:randomUUID(),speaker:'user',turnId,text,reason,at:new Date().toISOString()};
+    const userEntry={id:randomUUID(),speaker:'user',turnId,text,reason,at:new Date().toISOString(),...(isVoiceReason(reason)&&call.pendingSttProvider?{sttProvider:call.pendingSttProvider}:{}),...(isVoiceReason(reason)&&call.pendingSttCandidates?{sttCandidates:call.pendingSttCandidates}:{})};
+    call.pendingSttProvider=null;call.pendingSttCandidates=null;
     call.transcript.push(userEntry);
     if(isVoiceReason(reason))call.lastVoiceInput={transcriptId:userEntry.id,turnId,responseTurnId:turnId,text,at:Date.now(),reason};
     else call.lastVoiceInput=null;
@@ -720,7 +730,7 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='POST'&&pathname==='/api/auth'){
       const body=await readJson(req);
       if(!equalSecret(body.token,ACCESS_TOKEN))return sendJson(res,401,{error:'invalid_token'});
-      return sendJson(res,200,{ok:true},{'set-cookie':'codex_call_session='+encodeURIComponent(ACCESS_TOKEN)+'; Path=/call; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000'});
+      return sendJson(res,200,{ok:true},{'set-cookie':sessionCookie()});
     }
     if(pathname.startsWith('/api/')&&!authorized(req))return sendJson(res,401,{error:'authentication_required'});
     if(req.method==='GET'&&pathname==='/api/provider-usage'){
@@ -732,6 +742,10 @@ const server=http.createServer(async(req,res)=>{
       const body=await readJson(req);
       try{return sendJson(res,200,{ok:true,...tencentTrtc.configure(body.sdkSecretKey)});}
       catch(error){return sendJson(res,400,{ok:false,error:String(error?.message||error)});}
+    }
+    if(req.method==='GET'&&pathname==='/api/active-call'){
+      const active=currentActiveCall();
+      return sendJson(res,200,{ok:true,call:active?publicCall(active):null});
     }
     if(req.method==='GET'&&pathname==='/api/incoming-current'){
       let pending=[...calls.values()].filter(c=>c.direction==='incoming'&&c.state==='RINGING'&&!c.endedAt).sort((a,b)=>Date.parse(b.createdAt||0)-Date.parse(a.createdAt||0))[0]||null;
@@ -789,7 +803,7 @@ const server=http.createServer(async(req,res)=>{
       try{const file=turnAudioPath(historyAudio[1],historyAudio[2]);if(!fs.existsSync(file))return sendJson(res,404,{error:'audio_not_found'});const stat=fs.statSync(file);res.writeHead(200,{'content-type':'audio/mpeg','content-length':stat.size,'cache-control':'private, no-store'});fs.createReadStream(file).pipe(res);return;}catch{return sendJson(res,404,{error:'audio_not_found'});}
     }
     if(req.method==='GET'&&pathname==='/api/hrir/ku100-right25.json')return staticFile(res,'hrir/ku100-right25.json','application/json; charset=utf-8');
-    if(req.method==='GET'&&pathname==='/api/session')return sendJson(res,200,{ok:true});
+    if(req.method==='GET'&&pathname==='/api/session')return sendJson(res,200,{ok:true},{'set-cookie':sessionCookie()});
     if(req.method==='GET'&&pathname==='/api/tts/models')return sendJson(res,200,{
       models:Object.entries(TTS_MODELS).map(([id,label])=>({id,label})),default:TTS_MODEL,voice:'Companion',
       v4Tones:Object.entries(V4_TONES).map(([id,cfg])=>({id,label:cfg.label,playbackRate:cfg.playbackRate}))
@@ -806,6 +820,8 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='GET'&&pathname==='/api/stt/providers')return sendJson(res,200,{providers:{assemblyai:!!ASSEMBLYAI_API_KEY,scribe:!!ELEVENLABS_API_KEY},default:ASSEMBLYAI_API_KEY?'assemblyai':'scribe'});
 
     if(req.method==='POST'&&pathname==='/api/calls'){
+      const active=currentActiveCall();
+      if(active)return sendJson(res,409,{error:'active_call_exists',call:publicCall(active)});
       const body=await readJson(req);
       const ttsModel=String(body.ttsModel||TTS_MODEL);
       if(!Object.hasOwn(TTS_MODELS,ttsModel))return sendJson(res,400,{error:'unsupported_tts_model'});
@@ -813,6 +829,7 @@ const server=http.createServer(async(req,res)=>{
       if(!Object.hasOwn(V4_TONES,ttsTone)||(ttsModel!=='eleven_v4_turbo'&&ttsTone!=='original'))return sendJson(res,400,{error:'unsupported_tts_tone'});
       if(!USE_COMPANION_BRIDGE)return sendJson(res,503,{error:'companion_bridge_required'});
       const call=createCall(body.direction||'outgoing',ttsModel,ttsTone);
+      if(call.direction==='outgoing'){call.startedAt=new Date().toISOString();state(call,'LISTENING');}
       return sendJson(res,201,{ok:true,call:publicCall(call)});
     }
     const callItem=pathname.match(/^\/api\/calls\/([0-9a-f-]{36})$/i);
@@ -877,6 +894,11 @@ const server=http.createServer(async(req,res)=>{
       }
       if(action[2]==='stt'){
         const body=await readJson(req),type=String(body.type||''),text=String(body.text||'').trim(),now=Date.now();
+        if(type==='diagnostic'){
+          const d=body.diagnostic&&typeof body.diagnostic==='object'?body.diagnostic:{};
+          call.sttDiagnostics={provider:String(d.provider||'').slice(0,80),label:String(d.label||'').slice(0,120),settings:d.settings&&typeof d.settings==='object'?d.settings:{},bodyHearingEnabled:!!d.bodyHearingEnabled,at:String(d.at||new Date().toISOString())};
+          storage.save(call);return sendJson(res,200,{ok:true});
+        }
         if(type==='voice_start'){noteFollowupUserActivity(call,now);call.turnManager.onVoiceStart(now);return sendJson(res,200,{ok:true});}
         if(type==='partial'){
           if(text)noteFollowupUserActivity(call,now);
@@ -888,6 +910,16 @@ const server=http.createServer(async(req,res)=>{
         }
         if(type==='committed'){
           if(!text)return sendJson(res,400,{error:'empty_transcript'});
+          if(call.state==='ENDED')return sendJson(res,409,{error:'call_ended'});
+          const utteranceId=String(body.utteranceId||'');
+          if(/^[0-9a-f-]{36}$/i.test(utteranceId)){
+            call.sttUtterances??=new Set();
+            if(call.sttUtterances.has(utteranceId))return sendJson(res,200,{ok:true,duplicate:true});
+            call.sttUtterances.add(utteranceId);if(call.sttUtterances.size>800)call.sttUtterances.delete(call.sttUtterances.values().next().value);
+          }
+          call.pendingSttProvider=['assemblyai','tencent','scribe'].includes(body.provider)?body.provider:null;
+          const candidates=body.candidates&&typeof body.candidates==='object'?body.candidates:null;
+          call.pendingSttCandidates=candidates?{assemblyai:String(candidates.assemblyai||'').slice(0,500),tencent:String(candidates.tencent||'').slice(0,500)}:null;
           noteFollowupUserActivity(call,now);
           call.pendingVoiceTone=sanitizeVoiceTone(body.prosody);
           if(['WAITING_MODEL','WAITING_TTS','ASSISTANT_SPEAKING'].includes(call.state)){
@@ -904,7 +936,7 @@ const server=http.createServer(async(req,res)=>{
             }
             interrupt(call,'barge_in');
           }
-          if(String(body.provider||'')==='assemblyai'&&body.endOfTurn===true){
+          if(body.endOfTurn===true&&(String(body.provider||'')==='assemblyai'||body.clientEndpointed===true)){
             call.turnManager.reset();
             processTurn(call,text,'provider_end_of_turn').catch(error=>failCallTurn(call,error));
             return sendJson(res,200,{ok:true,classification:'speech',provider:'assemblyai',endOfTurn:true});

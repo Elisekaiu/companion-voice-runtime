@@ -22,16 +22,22 @@ Companion Voice Runtime 是一个可自托管的 AI 陪伴语音层，包含实�
 
 ### 2. 多 STT 编排，而不是把整通电话押在一个 provider 上
 
-参考栈使用：
+参考 hybrid 路径仍以 AssemblyAI `universal-3-6-pro` 作为主 realtime stream / turn clock；它可以单独工作。
 
-- 主 STT：AssemblyAI Universal-3.6 Pro Realtime
-- 中文/混合语言 sidecar：Tencent TRTC RealtimeTranscriber
-- 备用 STT：ElevenLabs Scribe v2 Realtime
-- TTS：ElevenLabs v4 Turbo
+如果你的通话以中文为主，**最推荐额外启用 Tencent Cloud 中文实时识别**。腾讯这条链更专注实时中文/RTC 场景，很适合优先拿来测试短句、日常聊天式普通话。这里说的是实际适配方向，**不是在声称它和微信使用同一套识别模型**。
 
-`web/stt-arbiter.js` 会在多个识别结果之间做仲裁，只提交一份最终 transcript。
+配置 Tencent 后，两家 STT 可以并行监听，`web/stt-arbiter.js` 只选择一份最终 transcript。ElevenLabs Scribe v2 Realtime 仍可作为额外替代路径。双线不是必须；它只是让两个失败模式不同的识别器互相兜底。
 
-轮次层还会保护“嗯、对呀、好”等短附和，不轻易把它们误判成打断；但明确的“等等、停一下”仍然可以立即打断 AI。
+这版还把“provider final”和“用户整句话结束”分开处理：
+
+- provider 的 final 只视为一个 ASR segment
+- `web/stt-turn-buffer.js` 等待真正的对话停顿再提交
+- 短暂停顿后继续说话不会立刻被切成两轮
+- 晚到的 Tencent / AssemblyAI segment 仍可并入同一轮
+- 重复 final 会去重
+- 最终只向 companion 提交一次
+
+这样比单纯把 provider 的 endpoint 当作用户说完更耐真实聊天里的停顿。
 
 ### 3. 有限度的自主续聊
 
@@ -41,19 +47,23 @@ Companion Voice Runtime 是一个可自托管的 AI 陪伴语音层，包含实�
 
 ### 4. 不只听文字，也保留“实际听见了什么”
 
-浏览器侧可以分析：
+浏览器侧可以本地分析环境音 / 非言语声音，以及音量、近似音高、音高变化、停顿、语速和句尾趋势。
 
-- 非言语声音
-- 音量
-- 近似音高
-- 音高变化
-- 停顿
-- 语速
-- 句尾趋势
+Hearing v2 使用 YAMNet + ONNX Runtime Web 在浏览器本地运行。YAMNet 会对 **521 个 AudioSet 类别**打分，参考实现使用约 **0.96 秒窗口 + 0.48 秒 hop（50% overlap）**，所以适合做低延迟的环境声音提示，而不需要为了声音分类把原始麦克风音频再上传到另一项云服务。
 
-只有真正被某一轮回复使用到的 cue，才会附着到那一轮 metadata 里并写入历史。
+公开版从原来少量 nonverbal cue 扩展到更日常的环境音，例如：
 
-这些 cue 只是**观察结果**，不是对情绪、意图、舒适度或其他隐藏状态的证明。
+- 音乐、雨、风、雷、流水、海浪
+- 脚步、键盘、门、敲门、门铃
+- 狗、猫、鸟
+- 交通、火车、飞机 / 直升机
+- 做饭、餐具、水龙头、吹风机、吸尘器
+- 电话铃、闹钟、警笛、钟表
+- 咳嗽、喷嚏、笑声等
+
+声音分为 **reactive** 与 **ambient** 两类。门铃、咳嗽、警笛等短促事件可以触发即时反应；音乐、雨声、打字等持续背景只作为听觉上下文保存，不会因为一直存在就反复让 companion 插嘴。
+
+YAMNet 是通用 AudioSet 分类器，不是“理解房间”的万能模型。阈值应该按真实手机、麦克风和房间重新调；任何命中都只是一条概率性的观察，不能拿来证明情绪、意图、舒适度、身份或隐藏身体状态。
 
 ### 5. 通话历史是一级数据
 
@@ -69,27 +79,32 @@ Companion Voice Runtime 是一个可自托管的 AI 陪伴语音层，包含实�
 
 ### 6. 针对手机浏览器做恢复
 
-移动 Safari 很容易打断：
+移动 Safari 很容易打断 AudioContext、microphone track、STT 连接、页面可见性和后台返回状态。
 
-- AudioContext
-- microphone track
-- STT 连接
-- 页面可见性
-- 后台返回状态
+这版除了保留手动“重新连接麦克风”入口，还补了几条运行时恢复：
 
-客户端包含这些恢复路径，并保留手动重新连接麦克风的入口。
+- 页面刷新 / PWA 被系统杀掉后，可以查询并接回仍在进行的 active call
+- 服务器会阻止同一部署同时新建第二通 overlapping active call
+- SSE / EventSource 失联后，前端会主动检查这通电话是否仍存在；如果已经结束或不存在，会正常收回旧通话 UI
+- 上次选择的 STT provider、TTS model / tone、binaural 模式会真正恢复，而不是只写进 localStorage 却不读取
 
-### 7. 长时间安静时自动休眠云端 STT
+如果整个 call service 本身重启，进行中的 websocket / STT / TTS 状态无法凭空恢复；这类情况仍会安全结束并保存为 `service_restart` 记录。
 
-参考 AssemblyAI 路径在约 30 秒没有语音后会关闭云端 STT session，但：
+### 7. 长时间安静时使用 Light Sleep
 
-- 麦克风仍在本地
-- 本地轻量 speech gate 继续监听
-- 保留约 3 秒 pre-roll
-- 检测到重新说话后自动重连云端 STT
-- Tencent sidecar 和主 STT 一起休眠/唤醒
+旧版在约 30 秒安静后会把云端 STT 一起关掉，再靠本地音量门槛唤醒。这样更省连接时间，但很轻的说话可能达不到本地 RMS 阈值。
 
-适合学习、发呆、睡觉或长时间安静陪伴，不必为了“电话还挂着”一直支付空闲 realtime session。
+现在 hybrid 路径改成 **Light Sleep**：
+
+- 约 30 秒没有语音后，只让 AssemblyAI realtime session 休眠
+- 配置了 Tencent 时，Tencent 继续在线作为语义级 wake path
+- Tencent 一旦重新转出语音，就可以唤醒 AssemblyAI，不要求轻声先跨过本地音量门槛
+- 本地 speech gate 仍保留，但只作为备用唤醒信号
+- 保留约 3 秒 pre-roll，AssemblyAI 重连后先补入缓冲音频
+- 如果 Tencent 没有配置 / 没连上，参考客户端不会自动让 AssemblyAI 休眠，优先保证轻声识别可靠性
+- 手动静音仍会主动关掉识别链路
+
+另外，若浏览器退出或网络异常导致 AssemblyAI 没有正常发回 termination 用量，客户端会用本地已发送音频时间做 fallback 记录。Provider 自己的账单仍然是最终权威，本地 Usage 只是运行时估算。
 
 ### 8. 可选 Usage Center
 
@@ -197,8 +212,8 @@ mic PCM ──▶ YAMNet worker ──────┐
 - localhost 以外需要 HTTPS 才能稳定使用麦克风 / PWA
 - 已认证的 Codex runtime，或你自己的 companion bridge
 - 默认 TTS 需要 ElevenLabs API
-- 默认 realtime STT 需要 AssemblyAI API
-- 中文 sidecar 可选 Tencent TRTC
+- 参考 realtime 主路径需要 AssemblyAI API
+- 中文为主时推荐额外启用 Tencent TRTC sidecar
 
 外部服务有各自的价格、地区、账号与条款要求。本仓库不提供任何服务凭据。
 
