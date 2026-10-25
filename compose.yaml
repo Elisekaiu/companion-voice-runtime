@@ -1,0 +1,53 @@
+services:
+  companion-voice-runtime:
+    image: node:22-bookworm-slim
+    container_name: companion-voice-runtime
+    user: "1000:1000"
+    working_dir: /app
+    command: ["node", "src/server.mjs"]
+    environment:
+      CALL_HOST: "0.0.0.0"
+      CALL_PORT: "8840"
+      CALL_DATA_DIR: "/data/calls"
+      CALL_ACCESS_TOKEN_FILE: "/data/secrets/call-access-token"
+      ELEVENLABS_API_KEY_FILE: "/data/secrets/elevenlabs-api-key"
+      ASSEMBLYAI_API_KEY_FILE: "/data/secrets/assemblyai-api-key"
+      CALL_PROVIDER_USAGE_ENABLED: "${CALL_PROVIDER_USAGE_ENABLED:-0}"
+      ASSEMBLYAI_RATE_USD_PER_HOUR: "${ASSEMBLYAI_RATE_USD_PER_HOUR:-0.45}"
+      ELEVENLABS_USAGE_API_KEY_FILE: "/data/secrets/elevenlabs-usage-api-key"
+      TENCENT_TRTC_SDK_APP_ID: "${TENCENT_TRTC_SDK_APP_ID:-0}"
+      TENCENT_TRTC_SDK_SECRET_KEY_FILE: "/data/secrets/tencent-trtc-sdk-secret-key"
+      ELEVENLABS_VOICE_ID: "${ELEVENLABS_VOICE_ID:-}"
+      ELEVENLABS_TTS_MODEL: "${ELEVENLABS_TTS_MODEL:-eleven_v4_turbo}"
+      CODEX_HOME: "/data/codex"
+      CODEX_MODEL: "${CODEX_MODEL:-gpt-5.6-sol}"
+      CODEX_EFFORT: "${CODEX_EFFORT:-low}"
+      COMPANION_BRIDGE_BASE: "${COMPANION_BRIDGE_BASE:-}"
+      COMPANION_BRIDGE_TOKEN_FILE: "/data/secrets/companion-bridge-token"
+      PUSH_SERVICE_URL: "${PUSH_SERVICE_URL:-}"
+    volumes:
+      - ./src:/app/src:ro
+      - ./web:/app/web:ro
+      - ./node_modules:/app/node_modules:ro
+      - ./workspace:/workspace:ro
+      - ./data:/data
+    ports:
+      - "127.0.0.1:${CALL_HOST_PORT:-8848}:8840"
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 0.75
+    pids_limit: 128
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8840/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"

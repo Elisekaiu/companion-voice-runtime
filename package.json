@@ -1,0 +1,28 @@
+{
+  "name": "companion-voice-runtime",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "setup": "node scripts/bootstrap.mjs",
+    "build:web": "esbuild web/app.js --bundle --format=esm --platform=browser --target=safari16 --external:/call/scribe-client.bundle.js --outfile=web/app.bundle.js && esbuild web/scribe-client.js --bundle --format=esm --platform=browser --target=safari16 --outfile=web/scribe-client.bundle.js && esbuild web/tencent-stt-client.js --bundle --format=esm --platform=browser --target=safari16 --outfile=web/tencent-stt-client.bundle.js && esbuild web/body-hearing-worker-src.js --bundle --format=esm --platform=browser --target=safari16 --outfile=web/body-hearing-worker.js && esbuild web/voice-prosody-worker-src.js --bundle --format=esm --platform=browser --target=safari16 --outfile=web/voice-prosody-worker.js",
+    "start": "node src/server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node test/smoke.mjs",
+    "check:room": "node --check web/app.js && node --check web/room.js && node --check src/server.mjs"
+  },
+  "dependencies": {
+    "@elevenlabs/client": "latest",
+    "@elevenlabs/elevenlabs-js": "latest",
+    "@openai/codex": "0.162.1",
+    "onnxruntime-web": "^1.23.2",
+    "tls-sig-api-v2": "^1.0.2",
+    "trtc-sdk-v5": "^5.20.2"
+  },
+  "devDependencies": {
+    "esbuild": "latest"
+  }
+}

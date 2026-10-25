@@ -1,0 +1,24 @@
+node_modules/
+.env
+.env.*
+!.env.example
+
+# All runtime/private data stays local.
+data/*
+!data/README.md
+
+# Local archaeology / one-off migration artifacts
+*.before-*
+*.bak
+patch-*.py
+
+# Browser build outputs
+web/app.bundle.js
+web/scribe-client.bundle.js
+web/tencent-stt-client.bundle.js
+web/body-hearing-worker.js
+web/voice-prosody-worker.js
+
+# Prepared by npm run setup; do not commit generated third-party runtime assets.
+web/ort/
+web/models/yamnet.onnx
