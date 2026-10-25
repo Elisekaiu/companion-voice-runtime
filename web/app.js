@@ -2,13 +2,15 @@ import { createRoom } from './room.js';
 import { localClock, resolveToneSelection } from './voice-schedule.js';
 import { REAL_SFX_GROUPS } from './real-sfx-catalog.js';
 import { baselineComparison, updateProsodyBaseline } from './voice-prosody-core.js';
-import { hasCjk, chooseHybridTranscript } from './stt-arbiter.js';
+import { SttTurnBuffer } from './stt-turn-buffer.js';
 
 const BASE='/call';
 const STT_KEYTERMS=['老公','老婆','宝宝','宝贝','爸爸','亲亲','我爱你','爱你','想你','Companion','伴侣','嗯','嗯嗯','嗯哼','啊','哦','噢','好呀','不要','等等','停一下'];
-const ASSEMBLY_INITIAL_CONTEXT='This is a private multilingual Chinese-and-English phone conversation between User and Companion. User may use very short affectionate Chinese utterances and fillers such as 老公、亲亲、嗯、啊、哦、我爱你. Preserve short replies as faithfully as possible and use the conversation context to disambiguate them.';
+const ASSEMBLY_INITIAL_CONTEXT='This is a private multilingual phone conversation between User and Companion. Preserve short replies faithfully. When Chinese and English hypotheses disagree, use the conversation context and specialist recognizer evidence rather than guessing.';
+const SPEECH_AUDIO_CONSTRAINTS={channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true};
 let callId=null,scribe=null,tencentStt=null,startedAt=0,timer=null,voiceStartedAt=0,muted=false,providersLoaded=false,providersLoadPromise=null,pendingTypedText='',micReconnectPromise=null,lastCallSurfaceHiddenAt=0;
-let tencentSttConfigured=false,tencentSttStatusLoaded=false;
+let tencentSttConfigured=false,tencentSttStatusLoaded=false,tencentClientPromise=null;
+const loadTencentClient=()=>tencentClientPromise||(tencentClientPromise=import('/call/tencent-stt-client.bundle.js?v=stt-buffer-20261026').catch(error=>{tencentClientPromise=null;throw error;}));
 let audioGeneration=0,audioQueue=Promise.resolve(),eventStream=null;
 const turnHeardCues=new Map();
 let audioCtx=null,currentSource=null,audioFetches=new Set(),pendingAudioSegments=0,assistantFinished=false,seenAudioSegments=new Set(),pcmWorkletLoadPromise=null;
@@ -284,8 +286,9 @@ function showPhone(){
   $('login').classList.add('hidden');$('phone').classList.remove('hidden');
   initBinauralPicker();setMutedState(false);syncBodyHearingUi();syncVoiceToneUi();
   if(pendingIncomingId)queueMicrotask(()=>prepareIncomingCall(pendingIncomingId).catch(()=>{}));
+  else queueMicrotask(()=>resumeActiveCall({quiet:true}).catch(()=>{}));
   if(lightBootStarted)return;lightBootStarted=true;
-  requestAnimationFrame(()=>{runWhenIdle(()=>loadCallHistory().catch(()=>{}),420);runWhenIdle(()=>{if(voiceToneEnabled)ensureVoiceToneWorker().catch(()=>{});},520);runWhenIdle(()=>{if(bodyHearingEnabled)ensureBodyHearingWorker().catch(()=>{});},640);runWhenIdle(()=>loadTencentSttStatus().catch(()=>{}),760);runWhenIdle(()=>loadSttProviders().catch(()=>{}),1100);});
+  requestAnimationFrame(()=>{runWhenIdle(()=>loadCallHistory().catch(()=>{}),420);runWhenIdle(()=>{if(voiceToneEnabled)ensureVoiceToneWorker().catch(()=>{});},520);runWhenIdle(()=>{if(bodyHearingEnabled)ensureBodyHearingWorker().catch(()=>{});},640);runWhenIdle(()=>loadTencentSttStatus().catch(()=>{}),760);runWhenIdle(()=>loadSttProviders().catch(()=>{}),900);runWhenIdle(()=>loadTtsModels().catch(()=>{}),1000);});
 }
 $('room-more')?.addEventListener('click',()=>{
   if(voiceToneEnabled)ensureVoiceToneWorker().catch(()=>{});
@@ -329,7 +332,8 @@ async function loadSttProviders(){
     const data=await api('/api/stt/providers',{},'GET');
     const available=data.providers||{};
     for(const option of select.options)option.disabled=!available[option.value];
-    let desired=available.assemblyai?'assemblyai':(available.scribe?'scribe':(data.default||'scribe'));
+    let saved='';try{saved=localStorage.getItem('companion-voice-runtime.stt-provider')||'';}catch{}
+    let desired=available[saved]?saved:(available.assemblyai?'assemblyai':(available.scribe?'scribe':(data.default||'scribe')));
     if(available[desired])select.value=desired;
     providersLoaded=true;
   })().finally(()=>{providersLoadPromise=null;});
@@ -340,15 +344,22 @@ async function loadTtsModels(){
   const data=await api('/api/tts/models',{},'GET');
   const available=new Set((data.models||[]).map(x=>x.id));
   for(const option of select.options)option.disabled=!available.has(option.value);
-  let selected=available.has('eleven_v4_turbo')?'eleven_v4_turbo':(data.default||'eleven_multilingual_v2');
+  let savedModel='';try{savedModel=localStorage.getItem('companion-voice-runtime.tts-model')||'';}catch{}
+  let selected=available.has(savedModel)?savedModel:(available.has('eleven_v4_turbo')?'eleven_v4_turbo':(data.default||'eleven_multilingual_v2'));
   if(available.has(selected))select.value=selected;
   const tones=Array.isArray(data.v4Tones)?data.v4Tones:[];
-  for(const tone of tones){
-    if(Number.isFinite(tone.playbackRate))v4PlaybackRates[tone.id]=tone.playbackRate;
+  const toneSelect=$('tts-tone');
+  if(toneSelect){
+    const existing=new Map(Array.from(toneSelect.options).map(option=>[option.value,option]));
+    for(const tone of tones){
+      if(Number.isFinite(tone.playbackRate))v4PlaybackRates[tone.id]=tone.playbackRate;
+      if(!existing.has(tone.id)){
+        const option=document.createElement('option');option.value=tone.id;option.textContent=tone.label||tone.id;toneSelect.append(option);existing.set(tone.id,option);
+      }
+    }
+    let savedTone='auto';try{savedTone=localStorage.getItem('companion-voice-runtime.tts-tone-mode')||'auto';}catch{}
+    toneSelect.value=existing.has(savedTone)?savedTone:'auto';
   }
-  // New users and previous test users start in auto. A deliberate selection
-  // made in THIS version is persisted as a manual override.
-  $('tts-tone').value='auto';
   updateToneVisibility();
 }
 function updateToneVisibility(){
@@ -372,7 +383,7 @@ function updateVoiceScheduleNote(){
   const zone=clock.timeZone?' · '+clock.timeZone:' · local time';
   note.textContent=clock.display+zone+' · '+(selected==='deep_night'?'Night voice':'Day voice')+' (22:00–07:59 night, 08:00–21:59 day)';
 }
-$('tts-model').addEventListener('change',updateToneVisibility);
+$('tts-model').addEventListener('change',()=>{try{localStorage.setItem('companion-voice-runtime.tts-model',$('tts-model').value);}catch{}updateToneVisibility();});
 $('tts-tone').addEventListener('change',()=>{
   try{localStorage.setItem('companion-voice-runtime.tts-tone-mode',$('tts-tone').value);}catch{}
   updateVoiceScheduleNote();
@@ -521,6 +532,11 @@ function addLine(who,text,id){
 function setStatus(text){if(/HTTP|assemblyai|elevenlabs|codex_|tts_|stt_|AssemblyAI|Scribe|密钥|接口/.test(text)){audioNote(text);text='声音连接暂时遇到问题，可以稍后再试。';}$('status').textContent=text;}
 $('transcript').addEventListener('scroll',()=>{const el=$('transcript');if(el.scrollHeight-el.scrollTop-el.clientHeight>70)el.dataset.reading='true';else delete el.dataset.reading;});
 function audioNote(text){const el=$('audio-diagnostic');if(el)el.textContent=text;}
+function reportMicDiagnostic(id,track,provider){
+  if(!id||!track)return;
+  let settings={};try{const x=track.getSettings?.()||{};settings={sampleRate:x.sampleRate||null,channelCount:x.channelCount||null,echoCancellation:x.echoCancellation??null,noiseSuppression:x.noiseSuppression??null,autoGainControl:x.autoGainControl??null};}catch{}
+  api('/api/calls/'+id+'/stt',{type:'diagnostic',diagnostic:{provider:String(provider||''),label:String(track.label||'').slice(0,120),settings,bodyHearingEnabled,at:new Date().toISOString()}}).catch(()=>{});
+}
 function binauralNote(text){const el=$('binaural-diagnostic');if(el)el.textContent=text;}
 function bodyHearingNote(text){const el=$('body-hearing-status');if(el)el.textContent=text;}
 function syncBodyHearingUi(){
@@ -535,20 +551,22 @@ function ensureBodyHearingWorker(){
   if(bodyHearingWorker&&!bodyHearingReady&&!bodyHearingLoading){try{bodyHearingWorker.terminate();}catch{}bodyHearingWorker=null;}
   if(bodyHearingLoading)return bodyHearingLoading;
   bodyHearingLoading=new Promise((resolve,reject)=>{
-    const worker=new Worker(BASE+'/body-hearing-worker.js?v=body-hearing-5',{type:'module'});
+    const worker=new Worker(BASE+'/body-hearing-worker.js?v=hearing-v2-20261026',{type:'module'});
     let settled=false;
     const timeout=setTimeout(()=>{if(!settled){settled=true;bodyHearingReady=false;bodyHearingNote('On-device · unavailable · timeout');try{worker.terminate();}catch{}if(bodyHearingWorker===worker)bodyHearingWorker=null;reject(new Error('body_hearing_load_timeout'));}},30000);
     worker.onmessage=event=>{
       const data=event.data||{};
       if(data.type==='ready'){
-        bodyHearingReady=true;bodyHearingNote('On-device · ready');
+        bodyHearingReady=true;bodyHearingNote('On-device · ready'+(data.groups?' · '+data.groups+' sound groups':''));
         if(!settled){settled=true;clearTimeout(timeout);resolve(worker);}
         return;
       }
       if(data.type==='heard'){
         const id=callId;
         if(!id||muted||!bodyHearingEnabled)return;
-        api('/api/calls/'+id+'/nonverbal',{key:data.key,score:Number(data.score)||0,continued:!!data.continued}).catch(()=>{});
+        const score=Math.max(0,Math.min(1,Number(data.score)||0));
+        bodyHearingNote('Heard · '+String(data.label||data.key)+' · '+Math.round(score*100)+'%');
+        api('/api/calls/'+id+'/nonverbal',{key:data.key,score,continued:!!data.continued}).catch(()=>{});
         return;
       }
       if(data.type==='error'){
@@ -696,7 +714,8 @@ $('voice-tone-reset')?.addEventListener('click',()=>{clearVoiceToneBaseline();ro
 function selectedBinauralMode(){return $('binaural-mode')?.value||'off';}
 function initBinauralPicker(){
   const select=$('binaural-mode');if(!select)return;
-  select.value='ku100-right25';
+  let saved='ku100-right25';try{saved=localStorage.getItem('companion-voice-runtime.binaural-mode')||saved;}catch{}
+  select.value=Array.from(select.options).some(option=>option.value===saved)?saved:'ku100-right25';
   binauralNote(select.value==='ku100-right25'?'贴耳声线会套 KU100 25cm 右耳近场':'贴耳声线保持原声');
 }
 $('body-hearing-toggle')?.addEventListener('change',event=>{setBodyHearingEnabled(!!event.currentTarget.checked);room.haptic();});
@@ -1051,20 +1070,34 @@ function subscribe(){
   stream.addEventListener('tts_segment',e=>{const d=JSON.parse(e.data);enqueueAudio(d.segmentId,Number.isFinite(d.playbackRate)?d.playbackRate:currentCallPlaybackRate,d.voiceProfile||'normal',d.text||'',d.turnId||null,d.performanceCue||null);});
   stream.addEventListener('interrupted',e=>{const d=JSON.parse(e.data);stopAudio();const live=document.getElementById('assistant-live');if(d.reason==='typed_repair')live?.remove();else live?.removeAttribute('id');assistant='';setStatus('听你说…');});
   stream.addEventListener('backchannel',e=>addLine('User',JSON.parse(e.data).text+'（附和）'));
-  // Raw detector events stay silent in the transcript. Only cues actually
-  // consumed by a Companion turn appear in its expandable “Heard cues” detail.
-  stream.addEventListener('nonverbal_heard',()=>{});
+  // Hearing v2 surfaces accepted sound events immediately; the same cues can
+  // also be attached to a later Companion turn as expandable context.
+  stream.addEventListener('nonverbal_heard',e=>{const d=JSON.parse(e.data||'{}');if(!d?.label)return;const pct=Math.round(Math.max(0,Math.min(1,Number(d.score)||0))*100);addHeardLine('Heard: '+String(d.label)+(pct?' · '+pct+'%':''));});
   stream.addEventListener('voice_tone',()=>{});
-  stream.addEventListener('error',e=>{if(e.data){const d=JSON.parse(e.data);audioNote(d.code);if(pendingTypedText&&$('typed-input')&&!$('typed-input').value){$('typed-input').value=pendingTypedText;pendingTypedText='';}setStatus('刚才这句没有送到老公这里，已经放回输入框。');}});
+  stream.addEventListener('error',e=>{
+    if(e.data){const d=JSON.parse(e.data);audioNote(d.code);if(pendingTypedText&&$('typed-input')&&!$('typed-input').value){$('typed-input').value=pendingTypedText;pendingTypedText='';}setStatus('That turn did not reach the companion. The typed text was restored.');return;}
+    const id=callId;if(!id||stream!==eventStream)return;setStatus('Reconnecting call…');
+    setTimeout(async()=>{
+      if(callId!==id||stream!==eventStream)return;
+      try{
+        const res=await fetch(BASE+'/api/calls/'+id,{credentials:'same-origin'});
+        if(res.status===404)return finishLostCallUi('This call has ended. Its record was kept.');
+        if(!res.ok)return;
+        const data=await res.json();if(data?.call?.endedAt||data?.call?.state==='ENDED')finishLostCallUi('This call has ended. Its record was kept.');
+      }catch{}
+    },1800);
+  });
 }
 async function startScribe(){
   const [{Scribe,RealtimeEvents,CommitStrategy,AudioFormat},{token},stream]=await Promise.all([
     import('/call/scribe-client.bundle.js'),
     api('/api/calls/'+callId+'/stt-token',{provider:'scribe'}),
-    navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:!bodyHearingEnabled,autoGainControl:true}})
+    navigator.mediaDevices.getUserMedia({audio:SPEECH_AUDIO_CONSTRAINTS})
   ]);
   let connection=null,opened=false,source=null,node=null,silentGain=null,processor=null,closed=false,stopMeter=null,micInterrupted=false;
   const micTrack=stream.getAudioTracks()[0];
+  try{if(micTrack&&'contentHint' in micTrack)micTrack.contentHint='speech';}catch{}
+  reportMicDiagnostic(callId,micTrack,'scribe');
   micTrack?.addEventListener('mute',()=>{micInterrupted=true;});
   micTrack?.addEventListener('ended',()=>{micInterrupted=true;});
   const toBase64=buffer=>{
@@ -1149,7 +1182,7 @@ async function startTencentSttForStream(stream,onMessage){
   if(status)status.textContent='Connecting…';
   try{
     const session=await api('/api/calls/'+callId+'/trtc-session',{});
-    const {startTencentTranscriber}=await import('/call/tencent-stt-client.bundle.js?v=tencent-stt-1');
+    const {startTencentTranscriber}=await loadTencentClient();
     const client=await startTencentTranscriber({
       ...session,
       audioTrack:track,
@@ -1175,19 +1208,24 @@ async function startTencentSttForStream(stream,onMessage){
 }
 
 async function startAssemblyAI(){
-  const mediaPromise=navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:!bodyHearingEnabled,autoGainControl:true}});
+  const connectingAt=performance.now();let micReadyMs=0,assemblyReadyMs=0,tencentReadyMs=0;
+  const mediaPromise=navigator.mediaDevices.getUserMedia({audio:SPEECH_AUDIO_CONSTRAINTS});
   const workletPromise=ensurePcmWorklet().catch(()=>false);
   const [stream]=await Promise.all([mediaPromise,workletPromise]);
+  micReadyMs=Math.round(performance.now()-connectingAt);
   const usageCallId=callId;
-  const SLEEP_AFTER_MS=30000;
   const PRE_ROLL_CHUNKS=30; // ~3 seconds at the 100 ms PCM worklet cadence.
-  let socket=null,cloudReady=false,cloudSleeping=false,cloudConnectPromise=null,cloudGeneration=0;
+  const ASSEMBLY_IDLE_SLEEP_MS=30000,ASSEMBLY_IDLE_CHECK_MS=2000;
+  let socket=null,cloudReady=false,cloudSleeping=false,cloudConnectPromise=null,cloudGeneration=0,tencentGeneration=0;
   let source=null,node=null,silentGain=null,processor=null,closed=false,stopMeter=null,tencentSidecar=null,micInterrupted=false;
-  let latestTencent=null,tencentSeq=0,activeHybridTurn=null,lastHybridCommitAt=0;
+  const turnBuffer=new SttTurnBuffer();let lastHybridCommitAt=0,commitBusy=false,turnTimer=null;
+  let assemblyFallbackId=0,tencentFallbackId=0,assemblyUsage=null;
   let agentContext=ASSEMBLY_INITIAL_CONTEXT,lastVoiceActivityAt=Date.now(),noiseFloor=.0035,voiceHits=0;
   let preRoll=[],inactivityTimer=null;
   const intentionalSockets=new WeakSet();
   const micTrack=stream.getAudioTracks()[0];
+  try{if(micTrack&&'contentHint' in micTrack)micTrack.contentHint='speech';}catch{}
+  reportMicDiagnostic(usageCallId,micTrack,'assemblyai+tencent');
   micTrack?.addEventListener('mute',()=>{micInterrupted=true;});
   micTrack?.addEventListener('ended',()=>{micInterrupted=true;});
 
@@ -1211,71 +1249,63 @@ async function startAssemblyAI(){
     try{preRoll.push(buffer.slice(0));}catch{return;}
     if(preRoll.length>PRE_ROLL_CHUNKS)preRoll.splice(0,preRoll.length-PRE_ROLL_CHUNKS);
   };
-  const beginHybridTurn=(provider='assemblyai')=>{
-    if(!activeHybridTurn||activeHybridTurn.committed){
-      activeHybridTurn={startedAt:Date.now(),tencentSeqAtStart:Math.max(0,tencentSeq-1),committed:false,finishing:false,voiceStartSent:false,fallbackTimer:null};
-    }
-    if(!voiceStartedAt){voiceStartedAt=activeHybridTurn.startedAt;startVoiceToneTurn();}
-    if(!activeHybridTurn.voiceStartSent){
-      activeHybridTurn.voiceStartSent=true;
-      api('/api/calls/'+callId+'/stt',{type:'voice_start',provider}).catch(()=>{});
-    }
-    return activeHybridTurn;
+  const noteSpeech=()=>{
+    if(!voiceStartedAt){voiceStartedAt=Date.now();startVoiceToneTurn();api('/api/calls/'+usageCallId+'/stt',{type:'voice_start',provider:'hybrid'}).catch(()=>{});}
   };
-  const finishHybridTurn=async({assemblyText='',tencentText='',tencentCompleted=false,providerHint='assemblyai'}={})=>{
-    const turn=activeHybridTurn||beginHybridTurn(providerHint);
-    if(turn.committed||turn.finishing)return;
-    turn.finishing=true;
+  const commitReadyTurn=async()=>{
+    if(closed||muted||commitBusy||callId!==usageCallId)return;
+    const choice=turnBuffer.take();if(!choice)return;
+    commitBusy=true;const duration=voiceStartedAt?Date.now()-voiceStartedAt:choice.durationMs;voiceStartedAt=0;
+    const utteranceId=crypto.randomUUID();
     try{
-      if(assemblyText&&hasCjk(assemblyText)&&tencentSidecar)await sleep(280);
-      const candidate=latestTencent&&latestTencent.seq>turn.tencentSeqAtStart&&latestTencent.at>=turn.startedAt-450&&Date.now()-latestTencent.at<2800?latestTencent:null;
-      const choice=assemblyText
-        ? chooseHybridTranscript({assemblyText,tencentText:tencentText||candidate?.text||'',tencentCompleted:tencentCompleted||!!candidate?.completed})
-        : chooseHybridTranscript({tencentText:tencentText||candidate?.text||'',tencentCompleted:true});
-      if(!choice.text){turn.finishing=false;return;}
-      turn.committed=true;
-      if(turn.fallbackTimer){clearTimeout(turn.fallbackTimer);turn.fallbackTimer=null;}
-      const duration=Math.max(0,Date.now()-turn.startedAt);
-      voiceStartedAt=0;
       const prosody=await finishVoiceToneTurn(choice.text,duration);
-      await api('/api/calls/'+callId+'/stt',{type:'committed',text:choice.text,voiceDurationMs:duration,provider:choice.provider||providerHint,endOfTurn:true,prosody}).catch(error=>setStatus(error.message));
+      if(closed||muted||callId!==usageCallId)return;
+      await api('/api/calls/'+usageCallId+'/stt',{type:'committed',text:choice.text,voiceDurationMs:duration,provider:choice.provider,endOfTurn:true,clientEndpointed:true,utteranceId,prosody,candidates:choice.candidates});
       lastHybridCommitAt=Date.now();
-    }finally{turn.finishing=false;}
+    }catch(error){setStatus('刚才那句话没能送达，请再说一次。');audioNote(String(error?.message||error));}
+    finally{commitBusy=false;}
   };
   const onTencentMessage=message=>{
-    if(muted||!message?.text)return;
-    tencentSeq++;
-    latestTencent={...message,seq:tencentSeq,at:Date.now()};
-    if(activeHybridTurn?.committed&&Date.now()-lastHybridCommitAt<1800)return;
-    if(!message.completed||!hasCjk(message.text))return;
-    const turn=beginHybridTurn('tencent');
-    if(turn.committed)return;
-    if(turn.fallbackTimer)clearTimeout(turn.fallbackTimer);
-    turn.fallbackTimer=setTimeout(()=>{finishHybridTurn({tencentText:message.text,tencentCompleted:true,providerHint:'tencent'}).catch(()=>{});},360);
+    if(closed||muted||callId!==usageCallId||!message?.text)return;
+    lastVoiceActivityAt=Date.now();turnBuffer.speech();
+    if(cloudSleeping&&!cloudConnectPromise)queueMicrotask(()=>maybeWake('tencent'));
+    const id=String(message.segmentId||('fallback-'+tencentFallbackId));
+    if(turnBuffer.update('tencent',{id:'tx-'+tencentGeneration+'-'+id,text:message.text,final:!!message.completed})){
+      noteSpeech();api('/api/calls/'+usageCallId+'/stt',{type:'partial',text:message.text,provider:'tencent'}).catch(()=>{});
+    }
+    if(message.completed&&!message.segmentId)tencentFallbackId++;
   };
-  const recordAssemblyTermination=(data,sessionId)=>{
-    if(!usageCallId||!sessionId)return;
-    api('/api/calls/'+usageCallId+'/provider-usage',{
-      provider:'assemblyai',sessionId,
-      sessionDurationSeconds:Number(data?.session_duration_seconds)||0,
-      audioDurationSeconds:Number(data?.audio_duration_seconds)||0
-    }).catch(()=>{});
+  const recordAssemblyUsage=(usage,data={}, {keepalive=false}={})=>{
+    if(!usageCallId||!usage?.sessionId)return;
+    const elapsed=Math.max(0,(Date.now()-Number(usage.startedAt||Date.now()))/1000);
+    const payload={
+      provider:'assemblyai',sessionId:usage.sessionId,
+      sessionDurationSeconds:Number(data?.session_duration_seconds)||elapsed,
+      audioDurationSeconds:Number(data?.audio_duration_seconds)||Number(usage.audioSeconds||0)
+    };
+    if(keepalive){
+      fetch(BASE+'/api/calls/'+usageCallId+'/provider-usage',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),credentials:'same-origin',keepalive:true}).catch(()=>{});
+      return;
+    }
+    api('/api/calls/'+usageCallId+'/provider-usage',payload).catch(()=>{});
   };
+  const flushAssemblyUsage=()=>{if(assemblyUsage)recordAssemblyUsage(assemblyUsage,{}, {keepalive:true});};
+  window.addEventListener('pagehide',flushAssemblyUsage);
   const closeTencent=()=>{
-    const sidecar=tencentSidecar||tencentStt;tencentSidecar=null;
+    const sidecar=tencentSidecar||tencentStt;tencentSidecar=null;tencentGeneration++;
     if(sidecar){sidecar.close().catch(()=>{});if(tencentStt===sidecar)tencentStt=null;}
   };
-  const closeCloud=({sleeping=true}={})=>{
+  const closeCloud=({sleeping=true,keepTencent=false}={})=>{
     cloudGeneration++;
     cloudReady=false;cloudSleeping=!!sleeping;
-    closeTencent();
+    if(!keepTencent)closeTencent();
     const ws=socket;socket=null;
     if(ws){
       intentionalSockets.add(ws);
       if(ws.readyState===WebSocket.OPEN){try{ws.send(JSON.stringify({type:'Terminate'}));}catch{}}
       setTimeout(()=>{try{if(ws.readyState<2)ws.close();}catch{}},700);
     }
-    if(sleeping&&!closed&&!muted)setStatus('STT · Sleeping');
+    if(sleeping&&!closed&&!muted)setStatus(keepTencent&&tencentSidecar?'STT · Light sleep':'STT · Sleeping');
   };
   const connectCloud=async({reason='wake'}={})=>{
     if(closed||muted||cloudReady)return true;
@@ -1283,6 +1313,15 @@ async function startAssemblyAI(){
     const generation=++cloudGeneration;
     cloudSleeping=false;
     cloudConnectPromise=(async()=>{
+      const existingTencent=tencentSidecar;
+      const tencentReady=existingTencent?Promise.resolve(existingTencent):(()=>{
+        const tg=++tencentGeneration;
+        return startTencentSttForStream(stream,message=>{if(!closed&&!muted&&tg===tencentGeneration)onTencentMessage(message);}).then(client=>{
+          if(client&&(closed||muted||tg!==tencentGeneration)){client.close().catch(()=>{});if(tencentStt===client)tencentStt=null;return null;}
+          if(client)tencentSidecar=client;
+          return client;
+        }).catch(()=>null);
+      })();
       const {token}=await api('/api/calls/'+usageCallId+'/stt-token',{provider:'assemblyai'});
       if(closed||muted||generation!==cloudGeneration)return false;
       const url=new URL('wss://streaming.assemblyai.com/v3/ws');
@@ -1290,11 +1329,11 @@ async function startAssemblyAI(){
       url.searchParams.set('encoding','pcm_s16le');
       url.searchParams.set('sample_rate','16000');
       url.searchParams.set('mode','balanced');
-      url.searchParams.set('min_turn_silence','320');
-      url.searchParams.set('max_turn_silence','1600');
+      url.searchParams.set('min_turn_silence','900');
+      url.searchParams.set('max_turn_silence','2400');
       url.searchParams.set('token',token);
       const ws=new WebSocket(url);ws.binaryType='arraybuffer';socket=ws;
-      let sessionId='';
+      const usage={sessionId:'',startedAt:Date.now(),audioSeconds:0,recorded:false};assemblyUsage=usage;
       const beginPromise=new Promise((resolve,reject)=>{
         const timeout=setTimeout(()=>reject(new Error('AssemblyAI 连接超时')),12000);
         ws.addEventListener('message',event=>{let d;try{d=JSON.parse(event.data);}catch{return;}if(d.type==='Begin'){clearTimeout(timeout);resolve(d);}}, {once:false});
@@ -1303,56 +1342,59 @@ async function startAssemblyAI(){
       ws.onmessage=async event=>{
         let data;try{data=JSON.parse(event.data);}catch{return;}
         if(data.type==='Begin'){
-          sessionId=String(data.id||sessionId||'');
+          usage.sessionId=String(data.id||usage.sessionId||'');usage.startedAt=Date.now();
           try{ws.send(JSON.stringify({type:'UpdateConfiguration',keyterms:STT_KEYTERMS,agent_context:agentContext}));}catch{}
           return;
         }
-        if(data.type==='Termination'){recordAssemblyTermination(data,sessionId);return;}
-        if(muted)return;
-        if(data.type==='SpeechStarted'){lastVoiceActivityAt=Date.now();beginHybridTurn('assemblyai');return;}
+        if(data.type==='Termination'){recordAssemblyUsage(usage,data);return;}
+        if(closed||muted||generation!==cloudGeneration||socket!==ws)return;
+        if(data.type==='SpeechStarted'){lastVoiceActivityAt=Date.now();turnBuffer.speech();noteSpeech();return;}
         if(data.type==='Turn'){
           const text=String(data.transcript||'').trim();if(!text)return;
-          const turn=beginHybridTurn('assemblyai');
-          if(data.end_of_turn){
-            if(turn.fallbackTimer){clearTimeout(turn.fallbackTimer);turn.fallbackTimer=null;}
-            await finishHybridTurn({assemblyText:text,providerHint:'assemblyai'});
-          }else api('/api/calls/'+callId+'/stt',{type:'partial',text,provider:'assemblyai'}).catch(()=>{});
+          const id=String(data.turn_order??('fallback-'+assemblyFallbackId));
+          if(turnBuffer.update('assemblyai',{id:usage.sessionId+'-'+id,text,final:!!data.end_of_turn})){
+            noteSpeech();api('/api/calls/'+usageCallId+'/stt',{type:'partial',text,provider:'assemblyai'}).catch(()=>{});
+          }
+          if(data.end_of_turn&&data.turn_order==null)assemblyFallbackId++;
         }
       };
       ws.onerror=()=>{};
       ws.onclose=()=>{
+        recordAssemblyUsage(usage);
+        if(assemblyUsage===usage)assemblyUsage=null;
         if(socket===ws){socket=null;cloudReady=false;}
         if(closed||intentionalSockets.has(ws)||generation!==cloudGeneration)return;
         cloudSleeping=true;
-        if(callId&&!muted&&!micReconnectPromise)setStatus('STT · Sleeping');
+        if(callId&&!muted&&!micReconnectPromise)setStatus(tencentSidecar?'STT · Light sleep':'STT · Sleeping');
       };
       await beginPromise;
       if(closed||muted||generation!==cloudGeneration){intentionalSockets.add(ws);try{ws.send(JSON.stringify({type:'Terminate'}));}catch{};setTimeout(()=>{try{ws.close();}catch{}},500);return false;}
       cloudReady=true;cloudSleeping=false;lastVoiceActivityAt=Date.now();
       const buffered=preRoll.slice();
-      for(const chunk of buffered){if(ws.readyState===WebSocket.OPEN)try{ws.send(chunk);}catch{}}
-      const client=await startTencentSttForStream(stream,onTencentMessage).catch(()=>null);
-      if(client){
-        if(closed||muted||generation!==cloudGeneration||cloudSleeping){client.close().catch(()=>{});if(tencentStt===client)tencentStt=null;}
-        else tencentSidecar=client;
-      }
+      for(const chunk of buffered){if(ws.readyState===WebSocket.OPEN)try{ws.send(chunk);usage.audioSeconds+=chunk.byteLength/32000;}catch{}}
+      assemblyReadyMs=Math.round(performance.now()-connectingAt);
+      const client=await tencentReady;tencentReadyMs=Math.round(performance.now()-connectingAt);
+      if(client&&existingTencent!==client)tencentSidecar=client;
       if(!closed&&!muted)setStatus('');
       return true;
     })().catch(error=>{
-      if(!closed&&!muted){cloudSleeping=true;setStatus(reason==='initial'?'声音连接中断了，可以先打字。':'STT · Sleeping');}
+      if(generation===cloudGeneration)closeCloud({sleeping:true,keepTencent:!!tencentSidecar});
+      if(!closed&&!muted){cloudSleeping=true;setStatus(reason==='initial'&&!tencentSidecar?'声音连接中断了，可以先打字。':(tencentSidecar?'STT · Light sleep':'STT · Sleeping'));}
       return false;
     }).finally(()=>{cloudConnectPromise=null;});
     return cloudConnectPromise;
   };
-  const maybeWake=()=>{
+  const maybeWake=(reason='voice')=>{
     if(closed||muted||!cloudSleeping||cloudConnectPromise)return;
-    connectCloud({reason:'voice'}).catch(()=>{});
+    connectCloud({reason}).catch(()=>{});
   };
   const sendAudio=buffer=>{
     if(!buffer?.byteLength)return;
     feedBodyHearing(buffer);feedVoiceTone(buffer);rememberPreRoll(buffer);
-    if(!muted&&localSpeech(buffer)){lastVoiceActivityAt=Date.now();maybeWake();}
-    if(!muted&&cloudReady&&socket?.readyState===WebSocket.OPEN)try{socket.send(buffer);}catch{}
+    if(!muted&&localSpeech(buffer)){lastVoiceActivityAt=Date.now();turnBuffer.speech();maybeWake('local');}
+    if(!muted&&cloudReady&&socket?.readyState===WebSocket.OPEN){
+      try{socket.send(buffer);if(assemblyUsage)assemblyUsage.audioSeconds+=buffer.byteLength/32000;}catch{}
+    }
   };
   try{
     if(audioCtx.audioWorklet&&window.AudioWorkletNode){
@@ -1361,18 +1403,21 @@ async function startAssemblyAI(){
       source=audioCtx.createMediaStreamSource(stream);processor=audioCtx.createScriptProcessor(4096,1,1);silentGain=audioCtx.createGain();silentGain.gain.value=0;processor.onaudioprocess=e=>sendAudio(downsamplePCM16(e.inputBuffer.getChannelData(0),audioCtx.sampleRate));source.connect(processor);processor.connect(silentGain);silentGain.connect(audioCtx.destination);
     }
   }catch(error){for(const track of stream.getTracks())track.stop();try{source?.disconnect();node?.disconnect();processor?.disconnect();silentGain?.disconnect();}catch{}throw error;}
-  stopMeter=room.measure(source,'user');
+  stopMeter=room.measure(source,'yau');
+  // Hybrid light sleep: after 30s of silence only AssemblyAI sleeps. Tencent
+  // remains online and can wake AssemblyAI even for speech below the local RMS threshold.
+  turnTimer=setInterval(()=>commitReadyTurn().catch(()=>{}),120);
   inactivityTimer=setInterval(()=>{
-    if(closed||muted||cloudSleeping||cloudConnectPromise||!cloudReady)return;
-    if(activeHybridTurn&&!activeHybridTurn.committed)return;
-    if(lastHybridCommitAt&&Date.now()-lastHybridCommitAt<2500)return;
-    if(Date.now()-lastVoiceActivityAt>=SLEEP_AFTER_MS)closeCloud({sleeping:true});
-  },1000);
+    if(closed||muted||cloudSleeping||!cloudReady||cloudConnectPromise||!tencentSidecar)return;
+    if(voiceStartedAt||commitBusy)return;
+    if(Date.now()-lastVoiceActivityAt<ASSEMBLY_IDLE_SLEEP_MS)return;
+    closeCloud({sleeping:true,keepTencent:true});
+  },ASSEMBLY_IDLE_CHECK_MS);
   scribe={
     setMuted(value){
       for(const track of stream.getAudioTracks())track.enabled=!value;
-      if(value){resetBodyHearing();resetVoiceToneTurn();closeCloud({sleeping:true});}
-      else{micInterrupted=false;lastVoiceActivityAt=Date.now();cloudSleeping=true;setStatus('STT · Sleeping');}
+      if(value){turnBuffer.reset();voiceStartedAt=0;resetBodyHearing();resetVoiceToneTurn();closeCloud({sleeping:true,keepTencent:false});}
+      else{micInterrupted=false;lastVoiceActivityAt=Date.now();cloudSleeping=true;connectCloud({reason:'unmute'}).catch(()=>{});}
     },
     updateContext(text){
       if(text)agentContext=String(text).slice(0,2000);
@@ -1381,17 +1426,18 @@ async function startAssemblyAI(){
     needsReconnect(){return micInterrupted||closed||stream.getAudioTracks().some(track=>track.readyState!=='live');},
     isSleeping(){return cloudSleeping;},
     disconnect(){
-      if(closed)return;closed=true;clearInterval(inactivityTimer);inactivityTimer=null;
-      closeCloud({sleeping:false});
-      if(activeHybridTurn?.fallbackTimer)clearTimeout(activeHybridTurn.fallbackTimer);
+      if(closed)return;closed=true;clearInterval(inactivityTimer);inactivityTimer=null;window.removeEventListener('pagehide',flushAssemblyUsage);flushAssemblyUsage();
+      closeCloud({sleeping:false,keepTencent:false});
+      clearInterval(turnTimer);turnBuffer.reset();
       stopMeter?.();
       try{source?.disconnect();}catch{} try{node?.disconnect();}catch{} try{processor?.disconnect();}catch{} try{silentGain?.disconnect();}catch{}
       for(const track of stream.getTracks())track.stop();
     }
   };
   const initial=await connectCloud({reason:'initial'});
-  if(!initial&&!closed){scribe.disconnect();scribe=null;throw new Error('AssemblyAI 连接失败');}
-  setStatus('');
+  audioNote('连接耗时 · mic '+micReadyMs+'ms · AssemblyAI '+assemblyReadyMs+'ms · Tencent '+tencentReadyMs+'ms');
+  if(!initial&&!closed&&!tencentSidecar){scribe.disconnect();scribe=null;throw new Error('AssemblyAI 连接失败');}
+  if(!initial&&tencentSidecar){cloudSleeping=true;setStatus('STT · Light sleep');}else setStatus('');
 }
 
 async function startSTT(){
@@ -1461,6 +1507,28 @@ function applyIncomingVoice(call){
   currentCallPlaybackRate=call?.ttsModel==='eleven_v4_turbo'?(v4PlaybackRates[call.ttsTone]||1):1;
   if($('tts-model')&&call?.ttsModel)$('tts-model').value=call.ttsModel;
 }
+function renderRecoveredTranscript(call){
+  $('transcript').innerHTML='';
+  for(const turn of call?.transcript||[]){
+    if(turn?.speaker==='user')addLine('User',String(turn.text||''),'user-turn-'+String(turn.turnId||turn.id||crypto.randomUUID()));
+    else if(turn?.speaker==='assistant')addLine('Companion',String(turn.text||''),'assistant-turn-'+String(turn.turnId||turn.id||crypto.randomUUID()));
+  }
+}
+async function resumeActiveCall({quiet=false}={}){
+  if(callId||ending||pendingIncomingId)return false;
+  let data;try{data=await api('/api/active-call',{},'GET');}catch{return false;}
+  const call=data?.call;if(!call||call.endedAt||call.state==='ENDED')return false;
+  if(call.direction==='incoming'&&call.state==='RINGING')return prepareIncomingCall(call.id);
+  if(!call.startedAt)return false;
+  stopHistoryVoice();callId=call.id;seenAudioSegments=new Set();turnHeardCues.clear();realSfxRecent=[];applyIncomingVoice(call);renderRecoveredTranscript(call);subscribe();
+  try{activateAudio();await startSTT();}catch(error){audioNote('Resume microphone: '+String(error?.message||error));}
+  startedAt=Date.parse(call.startedAt)||Date.now();clearInterval(timer);timer=setInterval(()=>{const sec=Math.max(0,Math.floor((Date.now()-startedAt)/1000));$('timer').textContent=String(Math.floor(sec/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0');},1000);
+  room.phase('active');callSurfaceVisible=true;syncCallPresence();$('call').disabled=true;$('stt-provider').disabled=true;$('tts-model').disabled=true;$('tts-tone').disabled=true;$('tts-preview').disabled=true;$('typed-input').disabled=false;$('typed-send').disabled=false;
+  setStatus('Call restored');setTimeout(()=>{if(callId===call.id&&$('status').textContent==='Call restored')setStatus('');},1600);
+  if(!quiet)room.toast('Restored the active call.');
+  setTimeout(()=>{if(callId===call.id)loadCachedRealSfx().catch(()=>{});},400);
+  return true;
+}
 async function fetchIncomingCall(value){
   let lastError=null;
   for(let attempt=0;attempt<6;attempt++){
@@ -1526,6 +1594,7 @@ $('call').onclick=async()=>{
   // Do this before the first await while the user gesture is still active.
   try{activateAudio();if(bodyHearingEnabled)ensureBodyHearingWorker().catch(()=>{});if(voiceToneEnabled)ensureVoiceToneWorker().catch(()=>{});}catch(error){dialing=false;$('call').disabled=false;room.foyer();setStatus('声音还没准备好，请再试一次。');return;}
   try{
+    await Promise.all([loadSttProviders().catch(()=>{}),loadTtsModels().catch(()=>{})]);
     const ttsModel=$('tts-model').value,ttsTone=selectedTone(new Date());
     if(selectedBinauralMode()==='ku100-right25')loadBinauralHrir().catch(()=>{});
     currentCallPlaybackRate=ttsModel==='eleven_v4_turbo'?(v4PlaybackRates[ttsTone]||1):1;
@@ -1542,11 +1611,21 @@ $('call').onclick=async()=>{
     timer=setInterval(()=>{const s=Math.floor((Date.now()-startedAt)/1000);$('timer').textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');},1000);
     room.phase('active');room.haptic();setStatus('已接通');callSurfaceVisible=true;syncCallPresence();setTimeout(()=>{if(callId&&$('status').textContent==='已接通')setStatus('');},1600);$('call').disabled=true;$('stt-provider').disabled=true;$('tts-model').disabled=true;$('tts-tone').disabled=true;$('tts-preview').disabled=true;$('typed-input').disabled=false;$('typed-send').disabled=false;
     setTimeout(()=>{if(callId)loadCachedRealSfx().catch(()=>{});},650);
-  }catch(error){audioNote(String(error.message||error));await finishCall({failed:true});setStatus('这次没能接通，稍后再试试。');}
+  }catch(error){
+    const message=String(error?.message||error);audioNote(message);
+    if(message.includes('active_call_exists')){callId=null;await resumeActiveCall({quiet:false});return;}
+    await finishCall({failed:true});setStatus('This call could not connect. Please try again.');
+  }
   finally{dialing=false;if(!callId)$('call').disabled=false;}
 };
 $('mute').onclick=()=>{if(!callId)return;setMutedState(!muted);room.haptic();room.toast(muted?'麦克风已静音':'我听得到你了');};
 $('reconnect-mic')?.addEventListener('click',()=>{room.haptic();reconnectMicrophone({force:true,quiet:false});});
+function finishLostCallUi(message='This call has ended.'){
+  if(!callId)return;
+  callId=null;scribe?.disconnect?.();scribe=null;eventStream?.close();eventStream=null;stopAudio();clearInterval(timer);currentCallPlaybackRate=1;seenAudioSegments=new Set();turnHeardCues.clear();realSfxRecent=[];resetBodyHearing();resetVoiceToneTurn();muted=false;
+  $('typed-input').disabled=true;$('typed-send').disabled=true;$('typed-input').value='';for(const key of ['call','stt-provider','tts-model','tts-tone','tts-preview'])$(key).disabled=false;
+  room.foyer();$('timer').textContent='00:00';setStatus(message);loadCallHistory().catch(()=>{});updateVoiceScheduleNote();
+}
 async function finishCall({failed=false}={}){
   if(ending)return;ending=true;
   const id=callId;room.phase('ending');setStatus('和 Companion 的通话结束了');

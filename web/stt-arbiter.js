@@ -10,8 +10,14 @@ export function chooseHybridTranscript({assemblyText='',tencentText='',tencentCo
   const assembly=normalizeTranscript(assemblyText);
   const tencent=normalizeTranscript(tencentText);
   if(!assembly)return tencent?{text:tencent,provider:'tencent'}:{text:'',provider:null};
+
+  // If a Chinese-specialist sidecar has a finalized Chinese hypothesis, prefer it
+  // over a short English hallucination from the primary recognizer.
+  if(tencentCompleted&&hasCjk(tencent)&&!hasCjk(assembly))return {text:tencent,provider:'tencent'};
+
   if(!hasCjk(assembly))return {text:assembly,provider:'assemblyai'};
   if(!tencent||!hasCjk(tencent))return {text:assembly,provider:'assemblyai'};
+
   const aLen=Array.from(assembly).length,tLen=Array.from(tencent).length;
   const completeEnough=tencentCompleted||aLen<=8||tLen>=Math.max(1,Math.floor(aLen*0.65));
   return completeEnough?{text:tencent,provider:'tencent'}:{text:assembly,provider:'assemblyai'};
