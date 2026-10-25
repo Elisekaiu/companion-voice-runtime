@@ -1,28 +1,17 @@
 import * as ort from 'onnxruntime-web/wasm';
+import {HEARING_GROUPS} from './hearing-catalog.js';
 
-// YAMNet (Google, Apache-2.0) converted to ONNX with the original
-// waveform frontend baked into the graph. Input is 16 kHz mono float PCM.
+// Hearing v2: YAMNet (Google, Apache-2.0) runs fully on-device.
+// Input is 16 kHz mono float PCM. We keep the native 0.96 s window for
+// low-latency transient sounds and use overlapping hops for continuity.
 const SAMPLE_RATE=16000;
-const WINDOW_SAMPLES=15360; // 0.96 s, one native YAMNet frame
+const WINDOW_SAMPLES=15360; // 0.96 s
 const HOP_SAMPLES=7680;     // 0.48 s
-const LOCAL_COOLDOWN_MS=4000;
 
-const WATCH=[
-  {key:'vocalization',label:'持续人声',members:[{index:22,threshold:0.30},{index:33,threshold:0.30}]},
-  {key:'breathing',label:'呼吸声',members:[{index:40,threshold:0.35},{index:36,threshold:0.55}]},
-  {key:'gasp',label:'急促吸气',members:[{index:39,threshold:0.40}]},
-  {key:'vibration',label:'震动声',singleThreshold:0.68,members:[
-    {index:517,threshold:0.35},{index:125,threshold:0.40},
-    {index:370,threshold:0.45},{index:376,threshold:0.45},{index:490,threshold:0.45}
-  ]},
-  {key:'water',label:'水声',singleThreshold:0.62,members:[
-    {index:282,threshold:0.35},{index:438,threshold:0.35},{index:439,threshold:0.35},
-    {index:291,threshold:0.38},{index:364,threshold:0.40},{index:442,threshold:0.35},
-    {index:443,threshold:0.30},{index:444,threshold:0.30},{index:446,threshold:0.35}
-  ]},
-  {key:'wet',label:'液体/摩擦声',singleThreshold:0.58,members:[{index:441,threshold:0.28},{index:440,threshold:0.30}]},
-  {key:'slap',label:'拍击声',singleThreshold:0.64,members:[{index:461,threshold:0.32},{index:454,threshold:0.42},{index:58,threshold:0.45}]}
-];
+// minStreak=1 is reserved for short/transient events and paired with a
+// higher singleThreshold to avoid noisy one-frame false positives.
+// Ambient sounds generally need two consecutive windows.
+const WATCH=HEARING_GROUPS;
 
 ort.env.wasm.numThreads=1;
 ort.env.wasm.proxy=false;
@@ -47,7 +36,7 @@ async function ensureSession(){
       graphOptimizationLevel:'all'
     });
     if(!session.inputNames.includes('waveform'))throw new Error('yamnet_waveform_input_missing');
-    postMessage({type:'ready'});
+    postMessage({type:'ready',groups:WATCH.length});
     return session;
   })().catch(error=>{
     loading=null;
@@ -88,7 +77,7 @@ function scoreTargets(scores){
     if(above){
       streak[group.key]=(streak[group.key]||0)+1;
       const instant=Number.isFinite(group.singleThreshold)&&best>=group.singleThreshold;
-      if(streak[group.key]>=2||instant)hits.push({group,score:best});
+      if(streak[group.key]>=Number(group.minStreak||2)||instant)hits.push({group,score:best});
     }else{
       streak[group.key]=0;
       continuous[group.key]=false;
@@ -97,12 +86,13 @@ function scoreTargets(scores){
 
   hits.sort((a,b)=>b.score-a.score);
   const now=Date.now();
-  for(const {group,score} of hits.slice(0,2)){
-    if(now-(lastEmit[group.key]||0)<LOCAL_COOLDOWN_MS)continue;
+  for(const {group,score} of hits.slice(0,3)){
+    const cooldown=Number(group.cooldownMs||10000);
+    if(now-(lastEmit[group.key]||0)<cooldown)continue;
     const continued=!!continuous[group.key];
     lastEmit[group.key]=now;
     continuous[group.key]=true;
-    postMessage({type:'heard',key:group.key,label:group.label,score,continued});
+    postMessage({type:'heard',key:group.key,label:group.label,kind:group.kind||'ambient',score,continued});
   }
 }
 
