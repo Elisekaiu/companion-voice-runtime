@@ -22,6 +22,20 @@ That last point is a **practical fit recommendation**, not a claim that this API
 
 Reference: <https://trtc.io/document/80841>
 
+#### Free-quota note (checked October 2026)
+
+Tencent's international **Tencent RTC** billing pages currently advertise **10,000 free minutes per month** for AI Recognition / RTC trial usage. The AI Recognition billing page describes a monthly pool shared across Speech-to-Text, AI Real-Time Translation, and Text-to-Speech; other Tencent RTC product pages describe the offer as a first-year / trial allowance. **Check the current console for your account and region before relying on it.**
+
+Mainland China's **Tencent Cloud ASR** is a different product/API family with different free quotas. Its current monthly free allowance is **5,000 successful calls for “one-sentence recognition”** and **5 hours for realtime speech recognition**. One-sentence recognition is for short audio (up to 60 seconds per call) and is not the same interface or billing unit as the streaming realtime path used for live calls.
+
+In other words: do not read “5,000 calls” as “5,000 realtime phone turns,” and do not assume international Tencent RTC and mainland Tencent Cloud ASR use the same signup, API, quota, or billing rules.
+
+Official references:
+- <https://trtc.io/document/67832>
+- <https://trtc.io/solutions/conversational-ai>
+- <https://cloud.tencent.com/document/product/1093/35686>
+- <https://cloud.tencent.com/document/product/1093/35802>
+
 ### Primary/general path: AssemblyAI Universal-3.6 Pro Realtime
 
 The reference hybrid client uses AssemblyAI `universal-3-6-pro` as its primary realtime stream and turn clock. It can also run without Tencent. It is useful for short voice-agent utterances, noisy/phone audio, accents, and multilingual/code-switched speech.
@@ -29,6 +43,25 @@ The reference hybrid client uses AssemblyAI `universal-3-6-pro` as its primary r
 AssemblyAI describes Universal-3.6 Pro Realtime as a 32-language realtime model trained for voice-agent/telephony conversations, with automatic language detection and improved short-utterance handling.
 
 Reference: <https://www.assemblyai.com/blog/universal-3-6-pro-realtime>
+
+#### Bonus accuracy layer: keyterms first, local corrections last
+
+Universal-3.6 Pro Realtime includes **keyterms prompting** at no extra charge. AssemblyAI currently documents up to **100 terms** on streaming, and the list can be updated while a session is running. Use it for names, product terms, slang, acronyms, or other vocabulary the recognizer repeatedly misses.
+
+`agent_context` is complementary: it gives the realtime model the conversational situation, while keyterms anchor exact vocabulary. They solve a different problem from deterministic text replacement.
+
+AssemblyAI also has a separate **Custom Spelling** concept that behaves like find-and-replace after transcription, but do not conflate that with realtime keyterms. If your live deployment still has a handful of systematic mistakes, it can be reasonable to add a **small deployment-local replacement map** after STT as a final fallback:
+
+```text
+observed wrong form -> intended form
+```
+
+Keep that map private if it contains personal vocabulary, keep it small, and only add replacements you have repeatedly observed. Do not use it as a broad synonym rewriter: aggressive replacement can silently damage correct transcripts. Likewise, oversized keyterm lists can reduce overall accuracy, so A/B test the list instead of assuming “more hints” is always better.
+
+References:
+- <https://www.assemblyai.com/blog/fix-language-steering-streaming-transcription>
+- <https://www.assemblyai.com/blog/real-time-transcription-python>
+- <https://www.assemblyai.com/blog/when-keyterm-prompting-backfires>
 
 ### Additional fallback: ElevenLabs Scribe v2 Realtime
 

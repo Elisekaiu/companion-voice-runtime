@@ -26,11 +26,13 @@ A recent voice turn can be repaired by immediate typed input. Companion Voice Ru
 
 Companion Voice Runtime can run more than one recognizer against the same microphone stream and arbitrate the result rather than binding the whole call to one provider.
 
-For Chinese-first deployments, the reference guide now recommends trying **Tencent Cloud realtime speech recognition first**. Its realtime Chinese/RTC focus makes it a natural first benchmark for short, chat-like Mandarin utterances. This is a practical fit recommendation, **not** a claim that it uses the same recognition model as WeChat.
+The reference hybrid path still uses AssemblyAI `universal-3-6-pro` as the primary realtime stream / turn clock. For Chinese-heavy calls, **Tencent Cloud is the optional addition we most recommend enabling**: its realtime Chinese/RTC focus makes it a useful specialist for short, chat-like Mandarin utterances. This is a practical fit recommendation, **not** a claim that it uses the same recognition model as WeChat.
 
-AssemblyAI `universal-3-6-pro` remains a strong optional second path because it is built for realtime voice-agent speech, short utterances, noisy/phone audio, and multilingual code-switching. The runtime can run Tencent and AssemblyAI together and arbitrate one committed transcript; ElevenLabs Scribe remains an additional provider/fallback path. Dual recognition is optional rather than required.
+AssemblyAI can also run by itself and remains useful for short voice-agent utterances, noisy/phone audio, accents, and multilingual code-switching. If a small set of names or recurring terms is still misheard, Universal-3.6 Pro Realtime supports `keyterms_prompt` and `agent_context` as native accuracy controls. For stubborn, repeatable mistakes, a deployment can add a **small local post-transcription replacement map** as one last fallback. Keep it narrow and based on observed errors rather than using broad synonym rewriting.
 
-Provider-level `final` segments are no longer treated as the end of the user's thought. A turn buffer waits for conversational silence, merges late provider segments, deduplicates repeated finals, and commits only once. This reduces chopped turns when the speaker pauses briefly mid-sentence.
+When Tencent is configured, both recognizers can listen in parallel and the runtime arbitrates one committed transcript; ElevenLabs Scribe remains an additional alternate path. Dual recognition is optional rather than required.
+
+Provider-level `final` segments are not treated as the end of the user's thought. A turn buffer waits for conversational silence, merges late provider segments, deduplicates repeated finals, and commits only once. This reduces chopped turns when the speaker pauses briefly mid-sentence.
 
 ### Bounded autonomy
 
@@ -288,6 +290,10 @@ That license does **not** replace the licenses of third-party model files, runti
 
 ## Status
 
-This is a real personal system extracted into a public release, not a hosted product or turnkey telephony service. Expect sharp edges around provider setup, mobile-browser behavior, and optional external adapters.
+This is an **evolving personal-use runtime** extracted into a public release, not a hosted product or turnkey telephony service.
+
+It was built the same way it is still maintained: use it in real conversations, notice what feels wrong, reproduce the failure, then fix it. That also means this repository **cannot promise to be bug-free**, stable across every browser/provider/account/region combination, or perfectly tuned for someone else's speaking style.
+
+When a reproducible bug shows up in ongoing use, the repository is usually updated once the fix has been tested. Treat the project as a practical reference implementation, keep your own deployment recoverable, and test changes with the actual phone, browser, microphone and providers you plan to use.
 
 If you build on it, keep the provenance chain intact. That is part of the project.
