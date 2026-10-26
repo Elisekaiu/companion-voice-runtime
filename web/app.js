@@ -1,3 +1,4 @@
+import { splitCallBubbles } from './call-bubbles.js';
 import { createRoom } from './room.js';
 import { localClock, resolveToneSelection } from './voice-schedule.js';
 import { REAL_SFX_GROUPS } from './real-sfx-catalog.js';
@@ -399,7 +400,14 @@ async function loadSttProviders(){
   })().finally(()=>{providersLoadPromise=null;});
   return providersLoadPromise;
 }
+let ttsModelsLoaded=false,ttsModelsLoadPromise=null;
 async function loadTtsModels(){
+  if(ttsModelsLoaded)return;
+  if(ttsModelsLoadPromise)return ttsModelsLoadPromise;
+  ttsModelsLoadPromise=loadTtsModelsOnce().then(()=>{ttsModelsLoaded=true;}).finally(()=>{ttsModelsLoadPromise=null;});
+  return ttsModelsLoadPromise;
+}
+async function loadTtsModelsOnce(){
   const select=$('tts-model');if(!select)return;
   const data=await api('/api/tts/models',{},'GET');
   const available=new Set((data.models||[]).map(x=>x.id));
@@ -465,40 +473,15 @@ document.addEventListener('visibilitychange',()=>{
   if(callSurfaceVisible&&!napMode&&!muted&&(scribe?.needsReconnect?.()||(awayFor>1400&&!scribe?.isSleeping?.())))setTimeout(()=>reconnectMicrophone({force:true,quiet:true}),160);
 });
 window.addEventListener('focus',()=>{if(!callId)updateVoiceScheduleNote();});
-function splitLongCallBubble(text,max=76){
-  const source=String(text||'').trim();if(!source)return[];
-  if(Array.from(source).length<=max)return[source];
-  const out=[];let rest=source;
-  while(Array.from(rest).length>max){
-    const chars=Array.from(rest),windowText=chars.slice(0,max+1).join('');
-    let cut=Math.max(windowText.lastIndexOf('，'),windowText.lastIndexOf(','),windowText.lastIndexOf('；'),windowText.lastIndexOf(';'),windowText.lastIndexOf('、'));
-    if(cut<Math.floor(max*.45))cut=chars.slice(0,max).join('').lastIndexOf(' ');
-    if(cut<Math.floor(max*.4))cut=max-1;
-    const part=chars.slice(0,cut+1).join('').trim();if(part)out.push(part);
-    rest=chars.slice(cut+1).join('').trim();
-  }
-  if(rest)out.push(rest);return out;
-}
-function splitCallBubbles(text,who='Companion'){
-  const source=String(text||'').replace(/\r/g,'').trim();if(!source)return[];
-  const out=[];
-  for(const paragraph of source.split(/\n+/).map(x=>x.trim()).filter(Boolean)){
-    const sentences=paragraph.match(/[^。！？!?]+[。！？!?]+|[^。！？!?]+$/g)||[paragraph];
-    for(const sentence of sentences){
-      const clean=sentence.trim();if(!clean)continue;
-      const isCjk=/[㐀-鿿]/.test(clean);
-      const max=who==='User'?(isCjk?76:130):(isCjk?70:120);
-      out.push(...splitLongCallBubble(clean,max));
-    }
-  }
-  return out.length?out:[source];
-}
 function renderCallBubbles(row,who,text){
   const words=row.querySelector('.words');if(!words)return;
-  const pieces=splitCallBubbles(text,who);words.replaceChildren();
-  for(const piece of pieces){
-    const bubble=document.createElement('div');bubble.className='call-bubble';renderNaturalBubbleText(bubble,piece);words.append(bubble);
-  }
+  const pieces=splitCallBubbles(text,who);row.hidden=!pieces.length;
+  pieces.forEach((piece,index)=>{
+    let bubble=words.children[index];
+    if(!bubble){bubble=document.createElement('div');bubble.className='call-bubble';words.append(bubble);}
+    if(bubble.textContent!==piece)renderNaturalBubbleText(bubble,piece);
+  });
+  while(words.children.length>pieces.length)words.lastElementChild.remove();
 }
 const zhWordSegmenter=typeof Intl!=='undefined'&&typeof Intl.Segmenter==='function'
   ?new Intl.Segmenter('zh',{granularity:'word'}):null;
@@ -525,7 +508,10 @@ function naturalCjkTokens(text){
   return out;
 }
 function renderNaturalBubbleText(el,text){
-  const source=String(text||'');const tokens=naturalCjkTokens(source);
+  const source=String(text||'').trim();
+  const short=Array.from(source).length<=6&&!/\s/.test(source);el.classList.toggle('short-utterance',short);
+  if(short){el.textContent=source;return;}
+  const tokens=naturalCjkTokens(source);
   if(!tokens){el.textContent=source;return;}
   el.replaceChildren();
   for(const token of tokens){
@@ -1063,7 +1049,7 @@ async function playPreparedAudio(prepared,generation){
     gain.connect(compressor);finalNode=compressor;cleanupNodes.push(gain,compressor);
   }
   const voiceMix=audioCtx.createGain();voiceMix.gain.value=1;finalNode.connect(voiceMix);voiceMix.connect(audioCtx.destination);cleanupNodes.push(voiceMix);
-  const stopMeter=room.measure(voiceMix,'companion');cleanupNodes.push({disconnect:stopMeter});currentSource=source;
+  const stopMeter=room.measure(voiceMix,'assistant');cleanupNodes.push({disconnect:stopMeter});currentSource=source;
   // Do not delay playback for a network round trip just to report the playback state.
   const report=playbackTurn?{...playbackTurn}:null;
   audioNote('语音播放中…');
@@ -1244,13 +1230,13 @@ async function startScribe(){
     connection=Scribe.connect({
       token,modelId:'scribe_v2_realtime',commitStrategy:CommitStrategy.VAD,
       audioFormat:AudioFormat.PCM_16000,sampleRate:16000,
-      vadSilenceThresholdSecs:1.6,vadThreshold:0.30,minSpeechDurationMs:80,minSilenceDurationMs:180,
+      vadSilenceThresholdSecs:0.55,vadThreshold:0.30,minSpeechDurationMs:80,minSilenceDurationMs:180,
       languageCode:'zh',secondaryLanguages:['en'],
       keyterms:STT_KEYTERMS,
       noVerbatim:false
     });
   }catch(error){cleanup();try{connection?.close();}catch{}throw error;}
-  connection.on(RealtimeEvents.OPEN,()=>{opened=true;setStatus('');});
+  connection.on(RealtimeEvents.OPEN,()=>{opened=true;reportSttState('scribe','ready');setStatus('');});
   connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT,data=>{
     if(muted)return;
     if(!voiceStartedAt){voiceStartedAt=Date.now();startVoiceToneTurn();api('/api/calls/'+callId+'/stt',{type:'voice_start'}).catch(()=>{});}
@@ -1264,8 +1250,8 @@ async function startScribe(){
     if(napMode||closed||callId!==owner)return;
     api('/api/calls/'+owner+'/stt',{type:'committed',text:data.text,voiceDurationMs:duration,provider:'scribe',utteranceId,prosody}).catch(error=>setStatus(error.message));
   });
-  connection.on(RealtimeEvents.ERROR,error=>{if(!napMode)setStatus('听写错误：'+(error?.error||'连接失败'));});
-  connection.on(RealtimeEvents.CLOSE,()=>{opened=false;cleanup();if(callId&&!micReconnectPromise&&!napMode)setStatus('听写已断开');});
+  connection.on(RealtimeEvents.ERROR,error=>{if(!napMode){reportSttState('scribe','failed',error?.error||'client_error');setStatus('听写错误：'+(error?.error||'连接失败'));}});
+  connection.on(RealtimeEvents.CLOSE,()=>{opened=false;reportSttState('scribe','closed');cleanup();if(callId&&!micReconnectPromise&&!napMode)setStatus('听写已断开');});
   scribe={
     setMuted(value){for(const track of stream.getAudioTracks())track.enabled=!value;if(value){resetBodyHearing();resetVoiceToneTurn();}},
     updateContext(){},
@@ -1474,9 +1460,9 @@ async function startAssemblyAI(){
       const beginPromise=new Promise((resolve,reject)=>{
         const cleanup=()=>{clearTimeout(timeout);ws.removeEventListener('message',onMessage);ws.removeEventListener('error',onError);ws.removeEventListener('close',onClose);};
         const onMessage=event=>{let d;try{d=JSON.parse(event.data);}catch{return;}if(d.type==='Begin'){cleanup();resolve(d);}};
-        const onError=()=>{cleanup();reject(new Error('AssemblyAI 连接失败'));};
-        const onClose=()=>{cleanup();reject(new Error('AssemblyAI 连接已关闭'));};
-        const timeout=setTimeout(()=>{cleanup();reject(new Error('AssemblyAI 连接超时'));},12000);
+        const onError=()=>{cleanup();reject(new Error('AssemblyAI connection failed'));};
+        const onClose=()=>{cleanup();reject(new Error('AssemblyAI connection closed'));};
+        const timeout=setTimeout(()=>{cleanup();reject(new Error('AssemblyAI connection timed out'));},12000);
         ws.addEventListener('message',onMessage);ws.addEventListener('error',onError);ws.addEventListener('close',onClose);
       });
       ws.onmessage=async event=>{
@@ -1586,7 +1572,7 @@ async function startAssemblyAI(){
   const initial=await connectCloud({reason:'initial'});
   if(closed||callId!==usageCallId)throw new Error('call_cancelled');
   audioNote('连接耗时 · mic '+micReadyMs+'ms · AssemblyAI '+assemblyReadyMs+'ms · Tencent '+tencentReadyMs+'ms');
-  if(!initial&&!closed&&!tencentSidecar){scribe.disconnect();scribe=null;throw new Error('AssemblyAI 连接失败');}
+  if(!initial&&!closed&&!tencentSidecar){scribe.disconnect();scribe=null;throw new Error('AssemblyAI connection failed');}
   if(!initial&&tencentSidecar){cloudSleeping=true;setStatus('STT · Light sleep');}else setStatus('');
 }
 
@@ -1762,10 +1748,10 @@ $('call').onclick=async()=>{
     if(selectedBinauralMode()==='ku100-right25')loadBinauralHrir().catch(()=>{});
     currentCallPlaybackRate=ttsModel==='eleven_v4_turbo'?(v4PlaybackRates[ttsTone]||1):1;
     try{
-      localStorage.setItem('codex-call.tts-model',ttsModel);
-      localStorage.setItem('codex-call.tts-tone-mode',$('tts-tone').value);
-      localStorage.setItem('codex-call.tts-tone',ttsTone);
-      localStorage.setItem('codex-call.binaural-mode',selectedBinauralMode());
+      localStorage.setItem('companion-voice-runtime.tts-model',ttsModel);
+      localStorage.setItem('companion-voice-runtime.tts-tone-mode',$('tts-tone').value);
+      localStorage.setItem('companion-voice-runtime.tts-tone',ttsTone);
+      localStorage.setItem('companion-voice-runtime.binaural-mode',selectedBinauralMode());
     }catch{}
     audioNote(ttsModel==='eleven_v4_turbo'&&$('tts-tone').value==='auto'?
       '已按香港时间锁定本通音色：'+(ttsTone==='deep_night'?'晚安 Companion':'日常 Companion'):'已按所选音色拨号');

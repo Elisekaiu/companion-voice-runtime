@@ -398,6 +398,15 @@ main{position:relative;margin:auto;max-width:760px}
 }
 .memory-msg.user .emotion-shadow-note{text-align:right}
 
+/* Keep brief acknowledgements and their punctuation together. */
+.transcript .line .words .call-bubble.short-utterance,
+.history-conversation .memory-msg .memory-words.short-utterance {
+  white-space: nowrap !important;
+  word-break: keep-all !important;
+  overflow-wrap: normal !important;
+  min-inline-size: max-content !important;
+}
+
 /* Nap mode: keep the manual wake control compact and make the intentional
    listening-off state visible without crowding the call controls. */
 .controls .nap-wake-now{min-width:0!important;width:auto!important;flex:0 0 auto;padding:7px 11px!important;min-height:34px!important;font-size:10px!important;letter-spacing:.03em;color:var(--muted);border-color:var(--line);background:rgba(255,255,255,.025);opacity:.9}
