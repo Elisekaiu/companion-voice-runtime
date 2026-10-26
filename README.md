@@ -76,6 +76,14 @@ The runtime persists transcript structure, call duration, assistant audio segmen
 
 The browser client includes recovery paths for the things mobile Safari routinely interrupts: audio contexts, microphone tracks, STT connections, page visibility, and return-from-background behavior. It can also reconnect to an already-active call after a page reload/PWA restart, prevents a second overlapping active call from being created, and checks the server when the event stream disappears so stale call UI can close cleanly. A manual microphone reconnect path remains available when the OS wins.
 
+### Frontend responsiveness and cleanup
+
+The client reuses loaded TTS configuration and existing transcript bubble nodes instead of refetching configuration on every dial or rebuilding each bubble on every text delta. Short acknowledgements keep their punctuation on one line; closing quotes stay with their sentence.
+
+Recognizer sockets that close during startup fail immediately instead of waiting for the handshake timeout. Cancelled call startup cannot attach a late recognizer to a different call. Interrupted playback releases its audio nodes, failed incoming calls run full cleanup, and Tencent microphone clones stop locally before network teardown completes. Muting clears the recognition pre-roll buffer.
+
+These changes leave conversational silence thresholds unchanged. They remove avoidable frontend work and failure-path waits, but do not guarantee a particular end-to-end latency across devices or providers.
+
 ### Idle STT sleep / wake
 
 Long calls can contain long stretches of real silence. The reference hybrid path now uses **light sleep** instead of putting every recognizer to sleep at once:

@@ -1,3 +1,4 @@
+import { splitCallBubbles } from './call-bubbles.js';
 import { createRoom } from './room.js';
 import { localClock, resolveToneSelection } from './voice-schedule.js';
 import { REAL_SFX_GROUPS } from './real-sfx-catalog.js';
@@ -20,7 +21,7 @@ const ASSEMBLY_INITIAL_CONTEXT='This is a private multilingual phone conversatio
 const SPEECH_AUDIO_CONSTRAINTS={channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true};
 let callId=null,scribe=null,tencentStt=null,startedAt=0,timer=null,voiceStartedAt=0,muted=false,providersLoaded=false,providersLoadPromise=null,pendingTypedText='',micReconnectPromise=null,lastCallSurfaceHiddenAt=0;
 let tencentSttConfigured=false,tencentSttStatusLoaded=false,tencentClientPromise=null;
-const loadTencentClient=()=>tencentClientPromise||(tencentClientPromise=import('/call/tencent-stt-client.bundle.js?v=stt-buffer-20261026').catch(error=>{tencentClientPromise=null;throw error;}));
+const loadTencentClient=()=>tencentClientPromise||(tencentClientPromise=import('/call/tencent-stt-client.bundle.js?v=frontend-audit-20261026').catch(error=>{tencentClientPromise=null;throw error;}));
 let audioGeneration=0,audioQueue=Promise.resolve(),eventStream=null;
 const turnHeardCues=new Map();
 let audioCtx=null,currentSource=null,audioFetches=new Set(),pendingAudioSegments=0,assistantFinished=false,seenAudioSegments=new Set(),pcmWorkletLoadPromise=null;
@@ -350,7 +351,14 @@ async function loadSttProviders(){
   })().finally(()=>{providersLoadPromise=null;});
   return providersLoadPromise;
 }
+let ttsModelsLoaded=false,ttsModelsLoadPromise=null;
 async function loadTtsModels(){
+  if(ttsModelsLoaded)return;
+  if(ttsModelsLoadPromise)return ttsModelsLoadPromise;
+  ttsModelsLoadPromise=loadTtsModelsOnce().then(()=>{ttsModelsLoaded=true;}).finally(()=>{ttsModelsLoadPromise=null;});
+  return ttsModelsLoadPromise;
+}
+async function loadTtsModelsOnce(){
   const select=$('tts-model');if(!select)return;
   const data=await api('/api/tts/models',{},'GET');
   const available=new Set((data.models||[]).map(x=>x.id));
@@ -416,40 +424,15 @@ document.addEventListener('visibilitychange',()=>{
   if(callSurfaceVisible&&!muted&&(scribe?.needsReconnect?.()||(awayFor>1400&&!scribe?.isSleeping?.())))setTimeout(()=>reconnectMicrophone({force:true,quiet:true}),160);
 });
 window.addEventListener('focus',()=>{if(!callId)updateVoiceScheduleNote();});
-function splitLongCallBubble(text,max=76){
-  const source=String(text||'').trim();if(!source)return[];
-  if(Array.from(source).length<=max)return[source];
-  const out=[];let rest=source;
-  while(Array.from(rest).length>max){
-    const chars=Array.from(rest),windowText=chars.slice(0,max+1).join('');
-    let cut=Math.max(windowText.lastIndexOf('，'),windowText.lastIndexOf(','),windowText.lastIndexOf('；'),windowText.lastIndexOf(';'),windowText.lastIndexOf('、'));
-    if(cut<Math.floor(max*.45))cut=chars.slice(0,max).join('').lastIndexOf(' ');
-    if(cut<Math.floor(max*.4))cut=max-1;
-    const part=chars.slice(0,cut+1).join('').trim();if(part)out.push(part);
-    rest=chars.slice(cut+1).join('').trim();
-  }
-  if(rest)out.push(rest);return out;
-}
-function splitCallBubbles(text,who='Companion'){
-  const source=String(text||'').replace(/\r/g,'').trim();if(!source)return[];
-  const out=[];
-  for(const paragraph of source.split(/\n+/).map(x=>x.trim()).filter(Boolean)){
-    const sentences=paragraph.match(/[^。！？!?]+[。！？!?]+|[^。！？!?]+$/g)||[paragraph];
-    for(const sentence of sentences){
-      const clean=sentence.trim();if(!clean)continue;
-      const isCjk=/[㐀-鿿]/.test(clean);
-      const max=who==='User'?(isCjk?76:130):(isCjk?70:120);
-      out.push(...splitLongCallBubble(clean,max));
-    }
-  }
-  return out.length?out:[source];
-}
 function renderCallBubbles(row,who,text){
   const words=row.querySelector('.words');if(!words)return;
-  const pieces=splitCallBubbles(text,who);words.replaceChildren();
-  for(const piece of pieces){
-    const bubble=document.createElement('div');bubble.className='call-bubble';renderNaturalBubbleText(bubble,piece);words.append(bubble);
-  }
+  const pieces=splitCallBubbles(text,who);row.hidden=!pieces.length;
+  pieces.forEach((piece,index)=>{
+    let bubble=words.children[index];
+    if(!bubble){bubble=document.createElement('div');bubble.className='call-bubble';words.append(bubble);}
+    if(bubble.textContent!==piece)renderNaturalBubbleText(bubble,piece);
+  });
+  while(words.children.length>pieces.length)words.lastElementChild.remove();
 }
 const zhWordSegmenter=typeof Intl!=='undefined'&&typeof Intl.Segmenter==='function'
   ?new Intl.Segmenter('zh',{granularity:'word'}):null;
@@ -476,7 +459,10 @@ function naturalCjkTokens(text){
   return out;
 }
 function renderNaturalBubbleText(el,text){
-  const source=String(text||'');const tokens=naturalCjkTokens(source);
+  const source=String(text||'').trim();
+  const short=Array.from(source).length<=6&&!/\s/.test(source);el.classList.toggle('short-utterance',short);
+  if(short){el.textContent=source;return;}
+  const tokens=naturalCjkTokens(source);
   if(!tokens){el.textContent=source;return;}
   el.replaceChildren();
   for(const token of tokens){
@@ -1020,17 +1006,19 @@ async function playPreparedAudio(prepared,generation){
   audioNote('语音播放中…');
   let cuePlayback=Promise.resolve(false);
   const voiceDuration=data.buffer.duration/(Number.isFinite(data.playbackRate)?data.playbackRate:1);
-  await new Promise((resolve,reject)=>{
-    source.onended=()=>{stopMeter();resolve();};
-    try{
-      source.start(0);
-      if(data.performanceCue)cuePlayback=playPerformanceCue(data.performanceCue,{voiceDuration,voiceGain:voiceMix});
-    }catch(error){reject(error);}
-  });
-  await cuePlayback.catch(()=>false);
-  if(currentSource===source){
-    currentSource=null;try{source.disconnect();}catch{} for(const node of cleanupNodes)try{node.disconnect();}catch{}
-    audioNote('语音播放结束');
+  try{
+    await new Promise((resolve,reject)=>{
+      source.onended=resolve;
+      try{
+        source.start(0);
+        if(data.performanceCue)cuePlayback=playPerformanceCue(data.performanceCue,{voiceDuration,voiceGain:voiceMix});
+      }catch(error){reject(error);}
+    });
+    await cuePlayback.catch(()=>false);
+  }finally{
+    stopMeter();try{source.disconnect();}catch{}
+    for(const node of cleanupNodes)try{node.disconnect();}catch{}
+    if(currentSource===source){currentSource=null;audioNote('语音播放结束');}
   }
 }
 function maybeFinishPlayback(generation){
@@ -1212,31 +1200,36 @@ function downsamplePCM16(input,sourceRate,targetRate=16000){
 }
 
 async function startTencentSttForStream(stream,onMessage){
+  const ownerCallId=callId;
   if(!tencentSttStatusLoaded)await loadTencentSttStatus().catch(()=>null);
   if(!tencentSttConfigured)return null;
   const track=stream?.getAudioTracks?.()[0];
-  if(!track)return null;
+  if(!ownerCallId||callId!==ownerCallId||!track||track.readyState!=='live'||muted)return null;
   const status=$('tencent-stt-status');
   if(status)status.textContent='Connecting…';
   try{
-    const session=await api('/api/calls/'+callId+'/trtc-session',{});
+    const session=await api('/api/calls/'+ownerCallId+'/trtc-session',{});
     const {startTencentTranscriber}=await loadTencentClient();
+    if(callId!==ownerCallId||track.readyState!=='live'||muted)return null;
     const client=await startTencentTranscriber({
       ...session,
       audioTrack:track,
       onMessage,
       onState:event=>{
+        if(callId!==ownerCallId||track.readyState!=='live'||muted)return;
         if(!status)return;
         if(event?.error){reportSttState('tencent','failed',event.error);status.textContent='Fallback · '+(event.errorMessage||('error '+event.error));}
         else if(event?.state==='started'){reportSttState('tencent','ready');status.textContent='Active · Chinese + mixed speech';}
         else if(event?.state==='stopped')status.textContent='Ready · Chinese + mixed speech';
       },
-      onError:error=>{reportSttState('tencent','failed',error?.code||error?.name||'client_error');if(status)status.textContent='Fallback · '+String(error?.message||error);}
+      onError:error=>{if(callId!==ownerCallId||track.readyState!=='live'||muted)return;reportSttState('tencent','failed',error?.code||error?.name||'client_error');if(status)status.textContent='Fallback · '+String(error?.message||error);}
     });
+    if(callId!==ownerCallId||track.readyState!=='live'||muted){client.close().catch(()=>{});return null;}
     tencentStt=client;reportSttState('tencent','ready');
     if(status)status.textContent='Active · Chinese + mixed speech';
     return client;
   }catch(error){
+    if(callId!==ownerCallId||track.readyState!=='live'||muted)return null;
     reportSttState('tencent','failed',error?.code||error?.name||'start_failed');
     if(status){
       const message=String(error?.message||error);
@@ -1248,12 +1241,13 @@ async function startTencentSttForStream(stream,onMessage){
 }
 
 async function startAssemblyAI(){
+  const usageCallId=callId;
   const connectingAt=performance.now();let micReadyMs=0,assemblyReadyMs=0,tencentReadyMs=0;
   const mediaPromise=navigator.mediaDevices.getUserMedia({audio:SPEECH_AUDIO_CONSTRAINTS});
   const workletPromise=ensurePcmWorklet().catch(()=>false);
   const [stream]=await Promise.all([mediaPromise,workletPromise]);
   micReadyMs=Math.round(performance.now()-connectingAt);
-  const usageCallId=callId;
+  if(!usageCallId||callId!==usageCallId){for(const track of stream.getTracks())track.stop();throw new Error('call_cancelled');}
   const PRE_ROLL_CHUNKS=60; // ~6 seconds at the 100 ms PCM worklet cadence; helps rescue a turn during fallback startup.
   const ASSEMBLY_IDLE_SLEEP_MS=30000,ASSEMBLY_IDLE_CHECK_MS=2000,FALLBACK_KEEP_AWAKE_MS=90000,TENCENT_STABLE_BEFORE_SLEEP_MS=30000;
   let socket=null,cloudReady=false,cloudSleeping=false,cloudConnectPromise=null,cloudGeneration=0,tencentGeneration=0;
@@ -1393,9 +1387,12 @@ async function startAssemblyAI(){
       const ws=new WebSocket(url);ws.binaryType='arraybuffer';socket=ws;
       const usage={sessionId:'',startedAt:Date.now(),audioSeconds:0,recorded:false};assemblyUsage=usage;
       const beginPromise=new Promise((resolve,reject)=>{
-        const timeout=setTimeout(()=>reject(new Error('AssemblyAI 连接超时')),12000);
-        ws.addEventListener('message',event=>{let d;try{d=JSON.parse(event.data);}catch{return;}if(d.type==='Begin'){clearTimeout(timeout);resolve(d);}}, {once:false});
-        ws.addEventListener('error',()=>{clearTimeout(timeout);reject(new Error('AssemblyAI connection failed'));},{once:true});
+        const cleanup=()=>{clearTimeout(timeout);ws.removeEventListener('message',onMessage);ws.removeEventListener('error',onError);ws.removeEventListener('close',onClose);};
+        const onMessage=event=>{let d;try{d=JSON.parse(event.data);}catch{return;}if(d.type==='Begin'){cleanup();resolve(d);}};
+        const onError=()=>{cleanup();reject(new Error('AssemblyAI connection failed'));};
+        const onClose=()=>{cleanup();reject(new Error('AssemblyAI connection closed'));};
+        const timeout=setTimeout(()=>{cleanup();reject(new Error('AssemblyAI connection timed out'));},12000);
+        ws.addEventListener('message',onMessage);ws.addEventListener('error',onError);ws.addEventListener('close',onClose);
       });
       ws.onmessage=async event=>{
         let data;try{data=JSON.parse(event.data);}catch{return;}
@@ -1447,7 +1444,7 @@ async function startAssemblyAI(){
     connectCloud({reason}).catch(()=>{});
   };
   const sendAudio=buffer=>{
-    if(!buffer?.byteLength)return;
+    if(closed||muted||!buffer?.byteLength)return;
     feedBodyHearing(buffer);feedVoiceTone(buffer);rememberPreRoll(buffer);
     if(!muted&&localSpeech(buffer)){lastLocalSpeechAt=Date.now();lastVoiceActivityAt=Date.now();turnBuffer.speech();maybeWake('local');}
     if(!muted&&cloudReady&&socket?.readyState===WebSocket.OPEN){
@@ -1477,7 +1474,7 @@ async function startAssemblyAI(){
   scribe={
     setMuted(value){
       for(const track of stream.getAudioTracks())track.enabled=!value;
-      if(value){turnBuffer.reset();voiceStartedAt=0;resetBodyHearing();resetVoiceToneTurn();closeCloud({sleeping:true,keepTencent:false});}
+      if(value){preRoll=[];turnBuffer.reset();voiceStartedAt=0;resetBodyHearing();resetVoiceToneTurn();closeCloud({sleeping:true,keepTencent:false});}
       else{micInterrupted=false;lastVoiceActivityAt=Date.now();cloudSleeping=true;connectCloud({reason:'unmute'}).catch(()=>{});}
     },
     updateContext(text){
@@ -1500,6 +1497,7 @@ async function startAssemblyAI(){
     }
   };
   const initial=await connectCloud({reason:'initial'});
+  if(closed||callId!==usageCallId)throw new Error('call_cancelled');
   audioNote('Connect · mic '+micReadyMs+'ms · AssemblyAI '+assemblyReadyMs+'ms · Tencent '+tencentReadyMs+'ms');
   if(!initial&&!closed&&!tencentSidecar){scribe.disconnect();scribe=null;throw new Error('AssemblyAI connection failed');}
   if(!initial&&tencentSidecar){cloudSleeping=true;setStatus('STT · Light sleep');}else setStatus('');
@@ -1644,7 +1642,7 @@ async function acceptIncomingCall(){
     $('call').disabled=true;$('stt-provider').disabled=true;$('tts-model').disabled=true;$('tts-tone').disabled=true;$('tts-preview').disabled=true;$('typed-input').disabled=false;$('typed-send').disabled=false;
     setTimeout(()=>{if(callId)loadCachedRealSfx().catch(()=>{});},500);
   }catch(error){
-    audioNote(String(error?.message||error));eventStream?.close();eventStream=null;callId=null;room.foyer();setStatus(String(error?.message||'').includes('expired')?'刚刚错过了老公的来电。':'这次没有接起来。');
+    audioNote(String(error?.message||error));await finishCall({failed:true});setStatus(String(error?.message||'').includes('expired')?'刚刚错过了老公的来电。':'这次没有接起来。');
   }finally{dialing=false;}
 }
 async function declineIncomingCall(){
