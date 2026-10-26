@@ -114,6 +114,8 @@ The current hybrid client uses **light sleep**:
 
 The client also records a local AssemblyAI usage fallback when a browser/network exit prevents the normal provider termination event from arriving. Provider-reported billing remains authoritative; local usage is only a runtime estimate.
 
+For Tencent troubleshooting, the runtime now preserves the bounded TRTC `error` and `extraCode` values when the SDK provides them. These codes belong in diagnostics, not the normal call UI: the user-facing surface should say that fallback is active, while logs can retain the provider codes needed to distinguish configuration, room, network, or service failures. Retry backoff is reset only after Tencent has stayed healthy for a stability window, not merely because one reconnect briefly reported ready.
+
 ## Why keep one recognizer awake?
 
 An older design put every cloud recognizer to sleep after 30 seconds and relied on local RMS activity to wake them.

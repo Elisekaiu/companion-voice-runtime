@@ -15,6 +15,10 @@ import { CallStorage } from './call/storage.mjs';
 import { TencentTrtcConfig } from './call/tencent-trtc.mjs';
 import { FollowupState } from './call/followup.mjs';
 import { QuietHangup, parseQuietDecision } from './call/quiet-hangup.mjs';
+import { parseNapCommand, napAlarmPublic } from './call/nap-alarm.mjs';
+import { defaultWakePolicy, wakeSessionPublic } from './call/wake-negotiation.mjs';
+import { recentWakeContext, makeWakePolicyPrompt, applyWakePolicy, makeSnoozeDecisionPrompt, decideSnooze } from './call/wake-runtime.mjs';
+import { acceptPlaybackReport } from './call/playback-report.mjs';
 import { isVoiceReason, shouldRepairTyped, mergeRepairText, repairContext } from './call/turn-repair.mjs';
 import { CodexAppServer } from './codex/app-server.mjs';
 import { createProviderUsage } from './provider-usage.mjs';
@@ -82,16 +86,19 @@ const providerUsage=createProviderUsage({
 });
 const COMPANION_BRIDGE_BASE=String(process.env.COMPANION_BRIDGE_BASE||'').replace(/\/$/,'');
 const PUSH_SERVICE_URL=String(process.env.PUSH_SERVICE_URL||'').replace(/\/$/,'');
-const INCOMING_RING_MS=90000;
+const INCOMING_RING_MS=30000;
+const INCOMING_PUSH_RETRY_MS=3000;
 const COMPANION_BRIDGE_TOKEN=readSecret('COMPANION_BRIDGE_TOKEN');
 const USE_COMPANION_BRIDGE=!!(COMPANION_BRIDGE_BASE&&COMPANION_BRIDGE_TOKEN);
 let bridgeCodexInfo={model:null,effort:null,threadId:null,ready:false,usage:null};
 const storage=new CallStorage(DATA_DIR);
+const recoverableCalls=[];
 function recoverInterruptedStartedCalls(){
   let recovered=0;
   const endedAt=new Date().toISOString();
   for(const call of storage.list()){
-    if(call?.endedAt||!call?.startedAt)continue;
+    if(call?.endedAt)continue;
+    if(call.napAlarm?.active||call.wakeSession?.active||(call.direction==='incoming'&&call.state==='RINGING')){recoverableCalls.push(call);continue;}
     call.state='ENDED';call.endedAt=endedAt;
     call.transcript=Array.isArray(call.transcript)?call.transcript:[];
     if(!call.transcript.some(x=>x?.speaker==='system'&&x?.type==='hangup'))call.transcript.push({id:randomUUID(),speaker:'system',type:'hangup',reason:'service_restart',at:endedAt});
@@ -136,7 +143,7 @@ async function readBinary(req,maxBytes=1200000){
   return Buffer.concat(chunks,total);
 }
 function publicCall(call){
-  return {id:call.id,state:call.state,direction:call.direction,ttsTone:call.ttsTone,voiceProfile:call.intimacy?.active?'intimate':'normal',createdAt:call.createdAt,startedAt:call.startedAt,endedAt:call.endedAt,ringExpiresAt:call.ringExpiresAt||null,ringReason:call.ringReason||null,generation:call.generation,turnId:call.turnId,ttsModel:call.ttsModel,transcript:call.transcript};
+  return {id:call.id,state:call.state,direction:call.direction,ttsTone:call.ttsTone,voiceProfile:call.intimacy?.active?'intimate':'normal',createdAt:call.createdAt,startedAt:call.startedAt,endedAt:call.endedAt,ringExpiresAt:call.ringExpiresAt||null,ringReason:call.ringReason||null,ringAcknowledgedAt:call.ringAcknowledgedAt||null,generation:call.generation,turnId:call.turnId,ttsModel:call.ttsModel,napAlarm:napAlarmPublic(call.napAlarm),wakeSession:wakeSessionPublic(call.wakeSession),transcript:call.transcript};
 }
 function currentActiveCall(){
   return [...calls.values()].filter(call=>!call.endedAt&&call.state!=='ENDED').sort((a,b)=>Date.parse(b.startedAt||b.createdAt||0)-Date.parse(a.startedAt||a.createdAt||0))[0]||null;
@@ -237,8 +244,9 @@ function deleteCallArchive(id){
   for(const ext of ['m4a','webm','mp3','wav','m4a.tmp','webm.tmp'])fs.rmSync(path.join(RECORDINGS_DIR,id+'.'+ext),{force:true});
   fs.rmSync(file+'.tmp',{force:true});fs.rmSync(file,{force:true});
 }
-function createCall(direction='outgoing',ttsModel=TTS_MODEL,ttsTone='original'){
-  const call={id:randomUUID(),direction,ttsModel,ttsTone,state:'RINGING',createdAt:new Date().toISOString(),startedAt:null,endedAt:null,generation:0,turnId:0,codexThreadId:null,title:null,transcript:[],audioSegments:[],events:[],nextEventId:0,subscribers:new Set(),segments:new Map(),turnManager:new TurnManager(),intimacy:new IntimacyState(),followupState:new FollowupState(),followupTimer:null,lastVoiceInput:null,pendingRepair:null,finalizeTimer:null,activeAbort:null,activeCodexTurnId:null,activeInputReason:null,performanceState:new PerformanceState(),performanceCues:new Map(),performanceCueSent:new Set(),nonverbalLastSeen:Object.create(null),nonverbalPendingKeys:new Set(),pendingNonverbalDetails:[],nonverbalFlushTimer:null,pendingVoiceTone:null,pendingSttProvider:null,pendingSttCandidates:null,pendingSttUtteranceId:null,quietHangup:new QuietHangup(),ringExpiresAt:null,ringReason:null,ringTimer:null,postCallDeliveryPending:false,postCallNotifyReason:null,postCallNotifiedAt:null};
+function createCall(direction='outgoing',ttsModel=TTS_MODEL,ttsTone='original',restored=null){
+  const call={id:randomUUID(),direction,ttsModel,ttsTone,state:'RINGING',createdAt:new Date().toISOString(),startedAt:null,endedAt:null,generation:0,turnId:0,codexThreadId:null,title:null,transcript:[],audioSegments:[],events:[],nextEventId:0,subscribers:new Set(),segments:new Map(),turnManager:new TurnManager(),intimacy:new IntimacyState(),followupState:new FollowupState(),quietHangup:new QuietHangup(),followupTimer:null,lastVoiceInput:null,pendingRepair:null,finalizeTimer:null,activeAbort:null,activeCodexTurnId:null,activeInputReason:null,performanceState:new PerformanceState(),performanceCues:new Map(),performanceCueSent:new Set(),nonverbalLastSeen:Object.create(null),nonverbalPendingKeys:new Set(),pendingNonverbalDetails:[],nonverbalFlushTimer:null,pendingVoiceTone:null,pendingSttProvider:null,pendingSttCandidates:null,pendingSttUtteranceId:null,napAlarm:null,napTimer:null,napPushTimer:null,wakeSession:null,wakeTimer:null,ringExpiresAt:null,ringReason:null,ringTimer:null,ringPushTimer:null,ringPushCount:0,ringPushInFlight:false,ringAcknowledgedAt:null,postCallDeliveryPending:false,postCallNotifyReason:null,postCallNotifiedAt:null};
+  if(restored)Object.assign(call,restored,{generation:Number(restored.generation||0)+1});
   calls.set(call.id,call);storage.save(call);return call;
 }
 function incomingTone(){
@@ -259,24 +267,89 @@ function queueCallEndNotification(call,reason){
   const attempt=async(index=0)=>{try{await deliverCallEndNotification(call);}catch(error){if(index<3)setTimeout(()=>attempt(index+1),[2000,10000,30000][index]);else console.warn('[post-call-bridge]',JSON.stringify({callId:call.id,error:String(error?.message||error)}));}};
   queueMicrotask(()=>attempt(0));
 }
+function clearIncomingPushRetry(call){
+  if(!call)return;
+  clearTimeout(call.ringPushTimer);call.ringPushTimer=null;
+  if(call.ringAcknowledgedAt||call.endedAt||call.state!=='RINGING')call.ringPushAbort?.abort();
+}
 function finishIncomingRing(call,reason){
   if(!call||call.state!=='RINGING'||call.endedAt)return false;
-  clearTimeout(call.ringTimer);call.ringTimer=null;
+  clearTimeout(call.ringTimer);call.ringTimer=null;clearIncomingPushRetry(call);
+  call.ringPushAbort?.abort();call.ringPushInFlight=false;
   call.state='ENDED';call.endedAt=new Date().toISOString();
   call.transcript.push({id:randomUUID(),speaker:'system',type:'hangup',reason,at:call.endedAt});
   storage.save(call);event(call,'state',{state:'ENDED',reason});queueCallEndNotification(call,reason);return true;
 }
 function armIncomingTimeout(call){
   clearTimeout(call.ringTimer);
-  const delay=Math.max(0,Date.parse(call.ringExpiresAt||'')-Date.now());
-  call.ringTimer=setTimeout(()=>finishIncomingRing(call,'missed_call'),delay||INCOMING_RING_MS);
+  const expiresAt=Date.parse(call.ringExpiresAt||'');
+  const delay=Number.isFinite(expiresAt)?Math.max(0,expiresAt-Date.now()):INCOMING_RING_MS;
+  call.ringTimer=setTimeout(()=>finishIncomingRing(call,'missed_call'),delay);
+  call.ringTimer.unref?.();
+}
+function shouldRetryIncomingPush(call){
+  if(!call||call.direction!=='incoming'||call.state!=='RINGING'||call.endedAt||call.ringAcknowledgedAt)return false;
+  const expiresAt=Date.parse(call.ringExpiresAt||'');
+  return Number.isFinite(expiresAt)&&Date.now()<expiresAt;
+}
+function scheduleIncomingPushRetry(call,delay=Math.max(50,INCOMING_PUSH_RETRY_MS-(Date.now()-Number(call.ringLastPushAt||Date.now())))){
+  clearIncomingPushRetry(call);
+  if(!shouldRetryIncomingPush(call))return false;
+  const expiresAt=Date.parse(call.ringExpiresAt||'');
+  const remaining=Math.max(0,expiresAt-Date.now());
+  if(remaining<=0)return false;
+  call.ringPushTimer=setTimeout(()=>retryIncomingPush(call).catch(error=>console.warn('[incoming-ring-retry]',JSON.stringify({callId:call.id,error:String(error?.message||error)}))),Math.min(delay,remaining));
+  call.ringPushTimer.unref?.();
+  return true;
+}
+async function retryIncomingPush(call){
+  if(!shouldRetryIncomingPush(call))return false;
+  if(call.ringPushInFlight){scheduleIncomingPushRetry(call);return false;}
+  call.ringPushInFlight=true;
+  call.ringPushCount=Number(call.ringPushCount||0)+1;storage.save(call);
+  try{
+    const push=await pushIncomingCall(call);
+    console.log('[incoming-ring-retry]',JSON.stringify({callId:call.id,attempt:call.ringPushCount,pushSent:push.sent||0,expiresAt:call.ringExpiresAt}));
+  }catch(error){
+    console.warn('[incoming-ring-retry]',JSON.stringify({callId:call.id,attempt:call.ringPushCount,error:String(error?.message||error)}));
+  }finally{
+    call.ringPushInFlight=false;
+    if(shouldRetryIncomingPush(call))scheduleIncomingPushRetry(call);
+  }
+  return true;
+}
+function acknowledgeIncomingRing(call,state='visible'){
+  if(!call||call.direction!=='incoming'||call.state!=='RINGING'||call.endedAt)return false;
+  if(!call.ringAcknowledgedAt){
+    call.ringAcknowledgedAt=new Date().toISOString();
+    call.ringAckState=String(state||'visible').slice(0,40);
+    clearIncomingPushRetry(call);storage.save(call);
+    event(call,'ring_ack',{state:call.ringAckState,at:call.ringAcknowledgedAt});
+  }
+  return true;
 }
 async function pushIncomingCall(call){
-  if(!PUSH_SERVICE_URL)throw new Error('push_service_not_configured');
-  const response=await fetch(PUSH_SERVICE_URL+'/push/incoming-call',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({callId:call.id,body:call.ringReason||'老公想听听你的声音。',expiresAt:call.ringExpiresAt}),signal:AbortSignal.timeout(12000)});
+  if(!shouldRetryIncomingPush(call)||call.ringPushRequest)return {ok:true,sent:0};
+  const controller=new AbortController();call.ringPushAbort=controller;call.ringLastPushAt=Date.now();
+  const timeout=setTimeout(()=>controller.abort(),Math.min(2500,Math.max(1,Date.parse(call.ringExpiresAt)-Date.now())));
+  const request=(async()=>{
+  const response=await fetch(PUSH_SERVICE_URL+'/push/incoming-call',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({callId:call.id,body:call.ringReason||'Your Companion wants to hear your voice.',expiresAt:call.ringExpiresAt}),signal:controller.signal});
   const data=await response.json().catch(()=>({}));
   if(!response.ok||!data.ok||!data.sent)throw new Error('incoming_push_unavailable');
   return data;
+  })();call.ringPushRequest=request;
+  try{return await request;}finally{clearTimeout(timeout);if(call.ringPushRequest===request){call.ringPushRequest=null;call.ringPushAbort=null;}}
+}
+async function pushNapAlarmNotification(call){
+  try{
+    const response=await fetch(PUSH_SERVICE_URL+'/push/nap-alarm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({callId:call.id,body:'Your nap timer is up. Your Companion is calling you back.'}),signal:AbortSignal.timeout(12000)});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok||!data.ok)throw new Error(String(data.error||('nap_push_http_'+response.status)));
+    return data;
+  }catch(error){
+    console.warn('[nap-alarm-push]',JSON.stringify({callId:call?.id,error:String(error?.message||error)}));
+    return null;
+  }
 }
 function event(call,type,data={}){
   const payload={id:++call.nextEventId,type,callId:call.id,turnId:call.turnId,generation:call.generation,at:new Date().toISOString(),...data};
@@ -284,6 +357,215 @@ function event(call,type,data={}){
   const wire='id: '+payload.id+'\nevent: '+type+'\ndata: '+JSON.stringify(payload)+'\n\n';
   for(const res of call.subscribers){try{res.write(wire);}catch{call.subscribers.delete(res);}}
   return payload;
+}
+function clearNapTimer(call){
+  if(!call)return;
+  clearTimeout(call.napTimer);call.napTimer=null;
+  clearTimeout(call.napPolicyTimer);call.napPolicyTimer=null;call.napPolicyAbort?.abort();call.napPolicyAbort=null;
+}
+function clearNapPushTimer(call){
+  if(!call)return;
+  clearTimeout(call.napPushTimer);call.napPushTimer=null;
+}
+function napWakeLabel(wakeAt){
+  try{return new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Hong_Kong',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(wakeAt));}
+  catch{return '';}
+}
+function cancelNapAlarm(call,reason='cancelled'){
+  if(!call?.napAlarm?.active)return false;
+  clearNapTimer(call);clearNapPushTimer(call);
+  const prior={...call.napAlarm};
+  call.napAlarm=null;
+  call.quietHangup?.activity(Date.now());
+  storage.save(call);
+  event(call,'nap_mode',{active:false,reason,wakeAt:prior.wakeAt||null});
+  return true;
+}
+function armNapAlarm(call,{wakeAt,sourceText='',mode='set',policy=null}={}){
+  const at=Number(wakeAt);
+  if(!call||call.endedAt||!Number.isFinite(at)||at-Date.now()<500)return false;
+  clearNapTimer(call);clearNapPushTimer(call);clearFollowupTimer(call);
+  if(call.wakeSession?.active)endWakeSession(call,'new_alarm');
+  clearTimeout(call.nonverbalFlushTimer);call.nonverbalFlushTimer=null;
+  call.napAlarm={
+    active:true,phase:'sleeping',wakeAt:new Date(at).toISOString(),
+    createdAt:new Date().toISOString(),sourceText:String(sourceText||'').slice(0,240),
+    wakeTurnId:null,mode:String(mode||'set'),policy:policy||defaultWakePolicy(sourceText,recentWakeContext(call))
+  };
+  call.quietHangup?.activity(Date.now());
+  storage.save(call);
+  event(call,'nap_mode',{active:true,phase:'sleeping',wakeAt:call.napAlarm.wakeAt,label:napWakeLabel(at),mode:call.napAlarm.mode});
+  const delay=Math.max(50,at-Date.now());
+  const armedAlarm=call.napAlarm;
+  call.napTimer=setTimeout(()=>{if(call.napAlarm===armedAlarm)triggerNapAlarm(call).catch(error=>failCallTurn(call,error));},delay);
+  call.napTimer.unref?.();
+  if(!policy){const token=call.napAlarm.createdAt;call.napPolicyTimer=setTimeout(()=>assessNapPolicy(call,token).catch(()=>{}),1200);call.napPolicyTimer.unref?.();}
+  return true;
+}
+async function triggerNapAlarm(call){
+  if(!call?.napAlarm?.active||call.endedAt||call.napAlarm.phase!=='sleeping')return false;
+  const wakeAt=Date.parse(call.napAlarm.wakeAt||'');
+  if(Number.isFinite(wakeAt)&&Date.now()+100<wakeAt){
+    clearNapTimer(call);
+    call.napTimer=setTimeout(()=>triggerNapAlarm(call).catch(error=>failCallTurn(call,error)),Math.max(50,wakeAt-Date.now()));
+    call.napTimer.unref?.();return false;
+  }
+  if(call.activeAbort||!['LISTENING','WAITING_TTS','ASSISTANT_SPEAKING'].includes(call.state)){
+    clearNapTimer(call);call.napTimer=setTimeout(()=>triggerNapAlarm(call).catch(error=>failCallTurn(call,error)),750);call.napTimer.unref?.();return false;
+  }
+  if(call.state!=='LISTENING'&&Date.now()-wakeAt>10000&&!call.activeAbort){interrupt(call,'nap_deadline');state(call,'LISTENING');}
+  if(call.state!=='LISTENING'){
+    clearNapTimer(call);call.napTimer=setTimeout(()=>triggerNapAlarm(call).catch(error=>failCallTurn(call,error)),750);call.napTimer.unref?.();return false;
+  }
+  clearNapTimer(call);clearNapPushTimer(call);
+  call.napAlarm.phase='waking';storage.save(call);
+  event(call,'nap_alarm',{phase:'due',wakeAt:call.napAlarm.wakeAt});
+  const alarm=call.napAlarm;
+  call.napPushTimer=setTimeout(()=>{
+    call.napPushTimer=null;
+    if(!call.endedAt&&call.napAlarm===alarm&&alarm.active&&alarm.phase!=='playing')pushNapAlarmNotification(call).catch(()=>{});
+  },10000);
+  call.napPushTimer.unref?.();
+  await processTurn(call,'','nap_alarm');
+  return true;
+}
+async function controlTurn(call,prompt,{signal}={}){
+  if(USE_COMPANION_BRIDGE)return streamCompanionBridgeTurn(prompt,{signal});
+  const threadId=await ensureThread(call);
+  return codex.turn(threadId,prompt,{model:CODEX_MODEL,effort:CODEX_EFFORT,signal,onDelta:()=>{},onStarted:()=>{},onMeta:()=>{}});
+}
+async function assessNapPolicy(call,alarmToken){
+  const alarm=call?.napAlarm;
+  if(!alarm?.active||alarm.createdAt!==alarmToken||call.endedAt||alarm.phase!=='sleeping')return;
+  if(call.activeAbort||call.state!=='LISTENING'){call.napPolicyTimer=setTimeout(()=>assessNapPolicy(call,alarmToken).catch(()=>{}),1200);return;}
+  const {prompt,fallback}=makeWakePolicyPrompt(call,alarm);
+  if(alarm.policy?.urgency==='strict'){fallback.urgency='strict';fallback.maxSnoozeMinutes=0;}
+  alarm.policy=fallback;storage.save(call);
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),12000);call.napPolicyAbort=controller;
+  try{
+    const result=await controlTurn(call,prompt,{signal:controller.signal});
+    if(!controller.signal.aborted&&!call.endedAt&&call.napAlarm===alarm&&alarm.phase==='sleeping'){
+      call.napAlarm.policy=applyWakePolicy(result.text,fallback);storage.save(call);
+    }
+  }catch{}
+  finally{clearTimeout(timeout);}
+}
+function clearWakeTimer(call){
+  if(!call)return;
+  clearTimeout(call.wakeTimer);call.wakeTimer=null;
+}
+function endWakeSession(call,reason='completed'){
+  if(!call?.wakeSession?.active)return false;
+  clearWakeTimer(call);
+  call.wakeSession=null;storage.save(call);
+  event(call,'wake_mode',{active:false,reason});
+  return true;
+}
+function noteWakeUserActivity(call,now=Date.now()){
+  if(!call?.wakeSession?.active)return;
+  clearWakeTimer(call);call.wakeSession.nextReminderAt=null;
+  call.wakeSession.pendingSnooze=null;call.wakeSession.lastTurnId=null;
+  call.wakeSession.lastActivityAt=new Date(now).toISOString();
+  call.wakeSession.phase='listening';
+  storage.save(call);
+}
+function scheduleWakeReminder(call){
+  clearWakeTimer(call);
+  const wake=call?.wakeSession;
+  if(!wake?.active||call.endedAt||wake.phase!=='listening')return false;
+  const max=Math.max(1,Number(wake.policy?.maxReminders)||1);
+  if(Number(wake.reminderCount||0)>=max){
+    wake.phase='exhausted';storage.save(call);
+    event(call,'wake_mode',{active:true,phase:'exhausted',reminderCount:wake.reminderCount,maxReminders:max,urgency:wake.policy?.urgency||'normal'});
+    return false;
+  }
+  const wait=Math.max(20000,Math.min(90000,Number(wake.policy?.reminderIntervalSeconds||35)*1000));
+  wake.nextReminderAt=new Date(Date.now()+wait).toISOString();storage.save(call);
+  const due=wake.nextReminderAt;
+  call.wakeTimer=setTimeout(()=>{if(call.wakeSession===wake&&wake.nextReminderAt===due)triggerWakeReminder(call).catch(error=>failCallTurn(call,error));},wait);
+  call.wakeTimer.unref?.();
+  return true;
+}
+function beginWakeSession(call){
+  if(!call?.napAlarm?.active)return false;
+  const alarm={...call.napAlarm};
+  clearNapTimer(call);clearNapPushTimer(call);
+  call.napAlarm=null;
+  call.wakeSession={
+    active:true,phase:'listening',startedAt:new Date().toISOString(),
+    alarmSource:String(alarm.sourceText||'').slice(0,300),
+    originalWakeAt:String(alarm.wakeAt||''),
+    policy:alarm.policy||defaultWakePolicy(alarm.sourceText,recentWakeContext(call)),
+    reminderCount:0,lastActivityAt:new Date().toISOString(),
+    lastTurnId:null,pendingSnooze:null,nextReminderAt:null
+  };
+  storage.save(call);
+  event(call,'nap_mode',{active:false,reason:'wake_negotiation',wakeAt:alarm.wakeAt||null});
+  event(call,'wake_mode',{active:true,phase:'listening',urgency:call.wakeSession.policy.urgency,maxReminders:call.wakeSession.policy.maxReminders});
+  scheduleWakeReminder(call);
+  return true;
+}
+function completeWakeReply(call,turnId){
+  const wake=call?.wakeSession;
+  if(!wake?.active||wake.phase!=='replying'||Number(wake.lastTurnId)!==Number(turnId))return false;
+  if(wake.pendingSnooze&&wake.policy?.urgency!=='strict'&&wake.pendingSnooze.minutes<=Number(wake.policy?.maxSnoozeMinutes||0)){
+    const pending={...wake.pendingSnooze},policy=wake.policy,source=wake.alarmSource;
+    endWakeSession(call,'snooze_approved');
+    armNapAlarm(call,{wakeAt:Date.now()+pending.minutes*60000,sourceText:'再睡 '+pending.minutes+' 分钟；原闹钟：'+source,mode:'snooze',policy});
+    return true;
+  }
+  wake.pendingSnooze=null;wake.lastTurnId=null;wake.phase='listening';storage.save(call);
+  event(call,'wake_mode',{active:true,phase:'listening',urgency:wake.policy?.urgency||'normal',reminderCount:wake.reminderCount,maxReminders:wake.policy?.maxReminders||1});
+  scheduleWakeReminder(call);
+  return true;
+}
+async function triggerWakeReminder(call){
+  const wake=call?.wakeSession;
+  if(!wake?.active||call.endedAt||wake.phase!=='listening')return false;
+  if(call.state!=='LISTENING'||call.activeAbort){
+    clearWakeTimer(call);call.wakeTimer=setTimeout(()=>triggerWakeReminder(call).catch(error=>failCallTurn(call,error)),1000);call.wakeTimer.unref?.();return false;
+  }
+  const max=Math.max(1,Number(wake.policy?.maxReminders)||1);
+  if(Number(wake.reminderCount||0)>=max)return scheduleWakeReminder(call);
+  wake.reminderCount=Number(wake.reminderCount||0)+1;
+  wake.phase='reminding';storage.save(call);
+  event(call,'wake_mode',{active:true,phase:'reminding',reminderCount:wake.reminderCount,maxReminders:max,urgency:wake.policy?.urgency||'normal'});
+  await processTurn(call,'','wake_reminder');
+  return true;
+}
+async function processWakeSnooze(call,text,action,reason){
+  const wake=call?.wakeSession;if(!wake?.active)return processTurn(call,text,reason);
+  clearWakeTimer(call);clearFollowupTimer(call);
+  if(call.activeAbort)interrupt(call,'wake_snooze_request');
+  call.turnId+=1;
+  const turnId=call.turnId,generation=call.generation;
+  const userEntry={id:randomUUID(),speaker:'user',turnId,text,reason,at:new Date().toISOString(),...(isVoiceReason(reason)&&call.pendingSttProvider?{sttProvider:call.pendingSttProvider}:{}),...(isVoiceReason(reason)&&call.pendingSttCandidates?{sttCandidates:call.pendingSttCandidates}:{}),...(isVoiceReason(reason)&&call.pendingSttUtteranceId?{utteranceId:call.pendingSttUtteranceId}:{})};
+  call.pendingVoiceTone=null;call.pendingSttProvider=null;call.pendingSttCandidates=null;call.pendingSttUtteranceId=null;
+  call.transcript.push(userEntry);call.lastVoiceInput=isVoiceReason(reason)?{transcriptId:userEntry.id,turnId,responseTurnId:turnId,text,at:Date.now(),reason}:null;
+  if(defaultWakePolicy(wake.alarmSource,recentWakeContext(call)).urgency==='strict')wake.policy={...wake.policy,urgency:'strict',maxSnoozeMinutes:0};
+  wake.phase='deciding';wake.lastActivityAt=new Date().toISOString();storage.save(call);
+  event(call,'user_final',{text,reason});event(call,'wake_mode',{active:true,phase:'deciding',urgency:wake.policy?.urgency||'normal'});
+  const controller=new AbortController();call.activeAbort=controller;call.activeInputReason='wake_snooze_decision';state(call,'WAITING_MODEL');
+  const timeout=setTimeout(()=>controller.abort(),15000);
+  let decision=null;
+  try{
+    const result=await controlTurn(call,makeSnoozeDecisionPrompt(call,wake,action.minutes),{signal:controller.signal});
+    decision=decideSnooze(result.text,{minutes:action.minutes,policy:wake.policy});
+  }catch{
+    decision=decideSnooze('',{minutes:action.minutes,policy:wake.policy});
+  }finally{
+    clearTimeout(timeout);
+    if(call.activeAbort===controller){call.activeAbort=null;call.activeInputReason=null;}
+  }
+  if(call.endedAt||generation!==call.generation||call.wakeSession!==wake||turnId!==call.turnId)return;
+  const message=String(decision.message||'').trim()||(decision.action==='allow_snooze'?'好，再睡一会儿，到点我再叫你。':'这次不能赖了，起来吧。');
+  call.transcript.push({id:randomUUID(),speaker:'assistant',turnId,text:message,at:new Date().toISOString()});
+  wake.phase='replying';wake.lastTurnId=turnId;
+  wake.pendingSnooze=decision.action==='allow_snooze'?{minutes:decision.minutes}:null;
+  if(decision.action==='insist'&&decision.recheckAfterSeconds)wake.policy={...wake.policy,reminderIntervalSeconds:decision.recheckAfterSeconds};
+  storage.save(call);
+  addTtsSegment(call,message,turnId,generation);event(call,'assistant_done',{text:message,ttsAvailable:!!ELEVENLABS_API_KEY});
+  if(ELEVENLABS_API_KEY)state(call,'WAITING_TTS');else{state(call,'LISTENING');completeWakeReply(call,turnId);}
 }
 function consumeEmotionShadowResults(){
   if(!EMOTION_SHADOW_ENABLED)return;
@@ -307,21 +589,22 @@ function clearFollowupTimer(call){
   clearTimeout(call.followupTimer);call.followupTimer=null;
 }
 function noteFollowupUserActivity(call,now=Date.now()){
+  call.quietHangup?.userActivity(now);
+  noteWakeUserActivity(call,now);
   clearFollowupTimer(call);
   call.followupState?.resetByUser(now);
-  call.quietHangup?.userActivity(now);
 }
 function scheduleFollowup(call){
   clearFollowupTimer(call);
   const follow=call?.followupState;
-  if(!call||!follow||call.endedAt||call.state!=='LISTENING'||call.activeAbort||!follow.eligible)return false;
+  if(!call||!follow||call.endedAt||call.state!=='LISTENING'||call.activeAbort||call.napAlarm?.active||call.wakeSession?.active||!follow.eligible)return false;
   if(call.turnManager?.voiceStartedAt||call.turnManager?.partial||call.turnManager?.committed?.length)return false;
   const delay=follow.nextDelayMs();if(delay===null)return false;
   const elapsed=Math.max(0,Date.now()-Number(follow.lastActivityAt||Date.now()));
   const wait=Math.max(250,delay-elapsed);
   call.followupTimer=setTimeout(()=>{
     call.followupTimer=null;
-    if(call.endedAt||call.state!=='LISTENING'||call.activeAbort||!follow.eligible)return;
+    if(call.endedAt||call.state!=='LISTENING'||call.activeAbort||call.napAlarm?.active||call.wakeSession?.active||!follow.eligible)return;
     if(call.turnManager?.voiceStartedAt||call.turnManager?.partial||call.turnManager?.committed?.length){follow.pause();scheduleFollowup(call);return;}
     const required=follow.nextDelayMs();if(required===null)return;
     const idleMs=Math.max(0,Date.now()-Number(follow.lastActivityAt||Date.now()));
@@ -338,7 +621,7 @@ function scheduleNonverbalFlush(call,delay=1200){
   clearTimeout(call.nonverbalFlushTimer);
   call.nonverbalFlushTimer=setTimeout(()=>{
     call.nonverbalFlushTimer=null;
-    if(call.endedAt||call.state==='ENDED'||!call.intimacy.pendingNonverbals?.length)return;
+    if(call.endedAt||call.state==='ENDED'||call.napAlarm?.active||call.wakeSession?.active||!call.intimacy.pendingNonverbals?.length)return;
     if(call.state!=='LISTENING'||call.activeAbort){scheduleNonverbalFlush(call,650);return;}
     processTurn(call,'','nonverbal').catch(error=>failCallTurn(call,error));
   },delay);
@@ -348,7 +631,7 @@ function noteNonverbalDetection(call,{key,score=0,continued=false}={}){
   key=String(key||'');
   const label=NONVERBAL_LABELS[key];
   if(!label)return {accepted:false,error:'unknown_nonverbal'};
-  if(call.state==='RINGING'||call.state==='ENDED'||call.endedAt)return {accepted:false,error:'call_not_active'};
+  if(call.state==='RINGING'||call.state==='ENDED'||call.endedAt||call.napAlarm?.active||call.wakeSession?.active)return {accepted:false,error:'call_not_active'};
   const now=Date.now(),last=Number(call.nonverbalLastSeen[key]||0),reactive=REACTIVE_HEARING_KEYS.has(key);
   if(now-last<NONVERBAL_SERVER_COOLDOWN_MS)return {accepted:false,deduped:true,label,reactive};
   if(call.nonverbalPendingKeys.size>=4&&!call.nonverbalPendingKeys.has(key))return {accepted:false,limited:true,label,reactive};
@@ -360,10 +643,10 @@ function noteNonverbalDetection(call,{key,score=0,continued=false}={}){
   call.pendingNonverbalDetails.push({key,label,score:Number(safeScore.toFixed(3)),continued:!!continued,reactive,at:new Date(now).toISOString()});
   if(call.pendingNonverbalDetails.length>12)call.pendingNonverbalDetails.splice(0,call.pendingNonverbalDetails.length-12);
   event(call,'nonverbal_heard',{key,label,score:Number(safeScore.toFixed(3)),continued:!!continued,reactive});
-  if(reactive)scheduleNonverbalFlush(call);else storage.save(call);
+  if(reactive)scheduleNonverbalFlush(call);
+  else storage.save(call);
   return {accepted:true,label,reactive};
 }
-
 function buildHeardCues(heardDetails=[],toneDescription=null){
   const nonverbals=(Array.isArray(heardDetails)?heardDetails:[]).slice(0,4).map(item=>({
     key:String(item?.key||''),
@@ -521,12 +804,20 @@ async function ensureThread(call){
   return call.codexThreadId;
 }
 async function processTurn(call,text,reason){
+  call.napPolicyAbort?.abort();
   if(call.state==='ENDED')return;
   clearFollowupTimer(call);
   const nonverbalOnly=reason==='nonverbal';
   const incomingOpening=reason==='incoming_opening';
   const autonomousFollowup=reason==='autonomous_followup';
+  const napAlarmWake=reason==='nap_alarm';
+  const wakeReminder=reason==='wake_reminder';
   const typedRepair=reason==='typed_repair';
+  const napAction=(!nonverbalOnly&&!incomingOpening&&!autonomousFollowup&&!napAlarmWake&&!wakeReminder)
+    ? parseNapCommand(text,{active:!!(call.napAlarm?.active||call.wakeSession?.active)})
+    : null;
+  if(call.wakeSession?.active&&['set','snooze'].includes(napAction?.action))return processWakeSnooze(call,text,napAction,reason);
+  if(call.wakeSession?.active&&napAction?.action==='cancel')endWakeSession(call,'user_awake');
   const repair=typedRepair?call.pendingRepair:null;
   if(typedRepair)call.pendingRepair=null;
   if(nonverbalOnly&&!call.intimacy.pendingNonverbals?.length)return;
@@ -534,16 +825,17 @@ async function processTurn(call,text,reason){
   if(call.activeAbort)interrupt(call,'new_user_turn');
   call.turnId+=1;
   const turnId=call.turnId,generation=call.generation,turnStartedAt=Date.now();
+  if(napAlarmWake&&call.napAlarm?.active){call.napAlarm.wakeTurnId=turnId;storage.save(call);}
   call.activeInputReason=reason;
-  const transition=(nonverbalOnly||incomingOpening||autonomousFollowup)?{active:call.intimacy.active,changed:false}:call.intimacy.observeUser(text);
+  const transition=(nonverbalOnly||incomingOpening||autonomousFollowup||napAlarmWake||wakeReminder)?{active:call.intimacy.active,changed:false}:call.intimacy.observeUser(text);
   if(transition.changed)event(call,'voice_profile',{profile:transition.active?'intimate':'normal'});
-  const consumeHeard=!(incomingOpening||autonomousFollowup);
+  const consumeHeard=!(incomingOpening||autonomousFollowup||napAlarmWake||wakeReminder);
   const heard=consumeHeard?call.intimacy.consumeNonverbals():[];
   const heardDetails=heard.length?(call.pendingNonverbalDetails||[]).splice(0):[];
   if(heard.length)call.nonverbalPendingKeys.clear();
-  const voiceTone=(nonverbalOnly||incomingOpening||autonomousFollowup||typedRepair)?null:call.pendingVoiceTone;
+  const voiceTone=(nonverbalOnly||incomingOpening||autonomousFollowup||napAlarmWake||wakeReminder||typedRepair)?null:call.pendingVoiceTone;
   if(!nonverbalOnly)call.pendingVoiceTone=null;
-  const cueText=incomingOpening?String(call.ringReason||''):(autonomousFollowup?'':text);
+  const cueText=incomingOpening?String(call.ringReason||''):((autonomousFollowup||napAlarmWake||wakeReminder)?'':text);
   const performanceCue=call.performanceState.plan({text:cueText,intimate:call.intimacy.active,turnId,heardNonverbals:heard});
   if(performanceCue)call.performanceCues.set(turnId,performanceCue);
   const heardContext=heard.length
@@ -555,7 +847,14 @@ async function processTurn(call,text,reason){
   if(toneDescription)event(call,'voice_tone',{label:toneDescription.label});
   if(heardCues)event(call,'heard_cues',{cues:heardCues});
   const ambiguityGuard=isVoiceReason(reason)?'<call_context>电话语音转写偶尔会出现错词、语义断裂或只留下半句话。如果 User 当前这句明显无法可靠理解，不要强行脑补成长回答；先用一句很短、自然的话表示没完全听清或让她继续补完。只有当上下文足以明确恢复她的意思时才正常回答。</call_context>':'';
-  const sensedContext=[heardContext,toneContext,ambiguityGuard].filter(Boolean).join('\n');
+  const napActionContext=napAction?.action==='set'
+    ? '<call_context>User 刚刚明确设置了一个小睡叫醒：约 '+napAction.minutes+' 分钟后、香港时间 '+napWakeLabel(napAction.wakeAt)+' 叫她。系统已经接受这个计时；你只需要像电话里的人一样简短自然地确认，不要解释实现。</call_context>'
+    : napAction?.action==='snooze'
+      ? '<call_context>User 刚刚要求再睡 '+napAction.minutes+' 分钟。小睡计时已经延后；自然简短地答应她。</call_context>'
+      : napAction?.action==='cancel'
+        ? '<call_context>User 刚刚取消了小睡闹钟/表示自己已经醒了。计时已经取消；自然回应，不要解释实现。</call_context>'
+        : '';
+  const sensedContext=[heardContext,toneContext,ambiguityGuard,napActionContext].filter(Boolean).join('\n');
   const openingContext=incomingOpening
     ? '<call_context>这是你主动打给 User 的电话，电话刚刚接通，User 还没有先开口。你现在应该自然地先说第一句话。'+
       '这次主动来电的理由/触发是：'+String(call.ringReason||'你此刻想主动听听她的声音、和她说点什么。').slice(0,240)+'。'+
@@ -575,7 +874,12 @@ async function processTurn(call,text,reason){
       '不要提计时、沉默检测、follow-up、系统、任务或 prompt。通常一到两句即可，不要为了自主续聊硬开一个新话题。</call_context>'
     : '';
   const repairModelContext=typedRepair?repairContext({voiceText:repair?.voiceText||'',typedText:repair?.typedText||'',mergedText:text}):'';
-  const modelText=incomingOpening?openingContext:(autonomousFollowup?followupContext:(typedRepair?repairModelContext:(nonverbalOnly?heardContext:(sensedContext?text+'\n\n'+sensedContext:text))));
+  const napWakeContext=napAlarmWake
+    ? '<call_context>这是仍在进行中的电话。User 之前明确让你在 '+napWakeLabel(call.napAlarm?.wakeAt)+' 左右叫她起床，现在约定时间已经到了。她当时的原话是：'+String(call.napAlarm?.sourceText||'让我到时间叫醒她').slice(0,220)+'。这次叫醒强度是 '+String(call.napAlarm?.policy?.urgency||'normal')+'。现在主动、自然地叫醒她；strict 要明确一点但不要吓人，flexible 可以更温柔。不要提系统、timer、STT、任务或 prompt，也不要假装她刚刚又说了什么。</call_context>'
+    : '';
+  const wakeReminderContext=wakeReminder?'<call_context>这是叫醒后的追加提醒。上一轮叫醒后还没有听到 User 的新回应。现在是第 '+String(call.wakeSession?.reminderCount||1)+' 次追加提醒；原闹钟是：'+String(call.wakeSession?.alarmSource||'').slice(0,220)+'。当前叫醒强度是 '+String(call.wakeSession?.policy?.urgency||'normal')+'。自然地再催一次；strict 可以更明确，flexible 轻一点。只能说还没听到回应，不要假装知道她身体有没有动。</call_context>':'';
+  const wakeActiveContext=call.wakeSession?.active&&!wakeReminder?'<call_context>现在仍处于叫醒后的 Wake 阶段。除非 User 明确说自己醒了或起来了，否则不要擅自宣布叫醒完成；她只是含糊回应时，可以继续自然确认。</call_context>':'';
+  const modelText=wakeReminder?wakeReminderContext:(napAlarmWake?napWakeContext:(incomingOpening?openingContext:(autonomousFollowup?followupContext:(typedRepair?repairModelContext:(nonverbalOnly?heardContext:([text,sensedContext,wakeActiveContext].filter(Boolean).join('\n\n')))))));
   if(nonverbalOnly){
     call.transcript.push({id:randomUUID(),speaker:'system',type:'nonverbal',turnId,text:heard.join('、'),reason,at:new Date().toISOString()});
     storage.save(call);
@@ -584,6 +888,12 @@ async function processTurn(call,text,reason){
     storage.save(call);
   }else if(autonomousFollowup){
     call.transcript.push({id:randomUUID(),speaker:'system',type:'autonomous_followup',turnId,text:'followup '+followupIndex,reason,at:new Date().toISOString()});
+    storage.save(call);
+  }else if(napAlarmWake){
+    call.transcript.push({id:randomUUID(),speaker:'system',type:'nap_alarm',turnId,text:'wake '+String(call.napAlarm?.wakeAt||''),reason,at:new Date().toISOString()});
+    storage.save(call);
+  }else if(wakeReminder){
+    call.transcript.push({id:randomUUID(),speaker:'system',type:'wake_reminder',turnId,text:'reminder '+String(call.wakeSession?.reminderCount||1),reason,at:new Date().toISOString()});
     storage.save(call);
   }else if(typedRepair){
     call.transcript.push({id:randomUUID(),speaker:'system',type:'typed_repair',turnId,text:String(repair?.typedText||''),reason,at:new Date().toISOString(),repairOfTurnId:repair?.priorTurnId||null});
@@ -596,6 +906,8 @@ async function processTurn(call,text,reason){
     else call.lastVoiceInput=null;
     storage.save(call);event(call,'user_final',{text,reason});
   }
+  if(napAction?.action==='cancel'&&call.napAlarm?.active)cancelNapAlarm(call,'user_cancelled');
+  else if(!call.wakeSession?.active&&(napAction?.action==='set'||napAction?.action==='snooze'))armNapAlarm(call,{wakeAt:napAction.wakeAt,sourceText:text,mode:napAction.action});
   if(typedRepair&&call.lastVoiceInput)call.lastVoiceInput.responseTurnId=turnId;
   if(!codexReady)throw new Error(codexError?'codex_unavailable':'codex_starting');
   const threadId=USE_COMPANION_BRIDGE?null:await ensureThread(call);
@@ -603,13 +915,18 @@ async function processTurn(call,text,reason){
   const abort=new AbortController();call.activeAbort=abort;
   state(call,'WAITING_MODEL');
   let full='',speechBuffer='',firstDeltaAt=0,fastStarted=false;
+  const responseWatchdog=setTimeout(()=>{
+    if(generation!==call.generation||firstDeltaAt||call.activeAbort!==abort)return;
+    abort.abort();state(call,'LISTENING');event(call,'error',{code:'model_first_response_timeout'});
+    console.warn('[call-model-stall]',JSON.stringify({callId:call.id,turnId,stage:'before_first_delta',elapsedMs:Date.now()-turnStartedAt}));
+  },20000);
   try{
     const hooks={signal:abort.signal,intimate:call.intimacy.active,
       onStarted:id=>{if(generation===call.generation){call.activeCodexTurnId=id;storage.save(call);}},
       onMeta:meta=>{if(generation===call.generation&&meta?.threadId){call.codexThreadId=meta.threadId;storage.save(call);}},
       onDelta:delta=>{
         if(generation!==call.generation)return;
-        if(!firstDeltaAt)firstDeltaAt=Date.now();
+        if(!firstDeltaAt){firstDeltaAt=Date.now();clearTimeout(responseWatchdog);}
         full+=delta;speechBuffer+=delta;event(call,'assistant_delta',{delta});
         const assistantTransition=call.intimacy.observeAssistant(full);
         if(assistantTransition.changed)event(call,'voice_profile',{profile:assistantTransition.active?'intimate':'normal'});
@@ -626,6 +943,7 @@ async function processTurn(call,text,reason){
       : await codex.turn(threadId,modelText,{model:CODEX_MODEL,effort:CODEX_EFFORT,...hooks});
     if(USE_COMPANION_BRIDGE&&result.threadId){call.codexThreadId=result.threadId;storage.save(call);}
     if(generation!==call.generation)return;
+    clearTimeout(responseWatchdog);
     if(!full)full=result.text;
     const split=splitSpeech(speechBuffer,true,{profile:call.intimacy.active?'intimate':'default'});
     for(const part of split.segments)addTtsSegment(call,part,turnId,generation);
@@ -633,10 +951,23 @@ async function processTurn(call,text,reason){
     call.transcript.push({id:randomUUID(),speaker:'assistant',turnId,text:final,at:new Date().toISOString(),...(heardCues?{heardCues}: {})});
     call.activeAbort=null;call.activeCodexTurnId=null;call.activeInputReason=null;
     call.performanceCues.delete(turnId);call.performanceCueSent.delete(turnId);
+    if(napAlarmWake&&call.napAlarm?.active&&call.napAlarm.phase!=='playing'){
+      call.napAlarm.phase=ELEVENLABS_API_KEY?'reply_ready':'wake_text_ready';
+      call.napAlarm.wakeTurnId=turnId;
+    }
+    if(call.wakeSession?.active&&!napAlarmWake&&!incomingOpening&&!autonomousFollowup&&!nonverbalOnly){
+      call.wakeSession.phase='replying';call.wakeSession.lastTurnId=turnId;
+    }
     storage.save(call);event(call,'assistant_done',{text:final,ttsAvailable:!!ELEVENLABS_API_KEY,...(heardCues?{heardCues}: {})});
+    if(napAlarmWake&&call.napAlarm?.active){
+      event(call,'nap_alarm',{phase:'reply_ready',turnId,wakeAt:call.napAlarm.wakeAt,ttsAvailable:!!ELEVENLABS_API_KEY});
+      if(!ELEVENLABS_API_KEY)beginWakeSession(call);
+    }
+    if(call.wakeSession?.active&&!ELEVENLABS_API_KEY&&Number(call.wakeSession.lastTurnId)===Number(turnId))completeWakeReply(call,turnId);
     console.log('[call-turn]',JSON.stringify({callId:call.id,turnId,reason,firstDeltaMs:firstDeltaAt?firstDeltaAt-turnStartedAt:null,totalModelMs:Date.now()-turnStartedAt,chars:final.length}));
     if(call.state!=='ASSISTANT_SPEAKING')state(call,ELEVENLABS_API_KEY?'WAITING_TTS':'LISTENING');
   }catch(error){
+    clearTimeout(responseWatchdog);
     // An interrupted older generation must not clear a newer turn's controller.
     if(call.activeAbort===abort){call.activeAbort=null;call.activeCodexTurnId=null;call.activeInputReason=null;}
     if(error.name==='AbortError'||error.message==='turn_aborted'){console.log('[call-turn]',JSON.stringify({callId:call.id,turnId,reason,interrupted:true,totalMs:Date.now()-turnStartedAt}));return;}
@@ -646,6 +977,7 @@ async function processTurn(call,text,reason){
 }
 function failCallTurn(call,error){
   call.activeAbort=null;call.activeCodexTurnId=null;call.activeInputReason=null;
+  if(call.napAlarm?.active&&call.napAlarm.phase==='waking'){pushNapAlarmNotification(call).catch(()=>{});clearNapPushTimer(call);call.napAlarm.phase='wake_failed';}
   call.state='LISTENING';storage.save(call);
   console.warn('[call-turn-error]',JSON.stringify({callId:call.id,turnId:call.turnId,error:String(error?.message||error)}));
   event(call,'error',{code:String(error?.message||error)});
@@ -729,29 +1061,39 @@ const server=http.createServer(async(req,res)=>{
     }
     if(req.method==='POST'&&pathname==='/internal/ring'){
       if(!authorizedVoiceBridge(req))return sendJson(res,401,{error:'unauthorized_voice_bridge'});
-      if(!USE_COMPANION_BRIDGE)return sendJson(res,503,{error:'companion_bridge_required'});
-      const body=await readJson(req),reason=String(body.reason||'').replace(/\s+/g,' ').trim().slice(0,120)||'老公想听听你的声音。';
+      if(!USE_COMPANION_BRIDGE)return sendJson(res,503,{error:'shared_runtime_required'});
+      const body=await readJson(req),reason=String(body.reason||'').replace(/\s+/g,' ').trim().slice(0,120)||'Your Companion wants to hear your voice.';
       const pending=[...calls.values()].find(c=>c.direction==='incoming'&&c.state==='RINGING'&&!c.endedAt);
       if(pending){
         pending.ringReason=reason;
-        pending.ringExpiresAt=new Date(Date.now()+INCOMING_RING_MS).toISOString();
+        const existingExpiry=Date.parse(pending.ringExpiresAt||'');
+        if(!Number.isFinite(existingExpiry)||existingExpiry<=Date.now()){finishIncomingRing(pending,'missed_call');return sendJson(res,200,{ok:true,rerung:true,expired:true,call:publicCall(pending)});}
         storage.save(pending);armIncomingTimeout(pending);
-        try{
-          const push=await pushIncomingCall(pending);
-          console.log('[incoming-ring]',JSON.stringify({callId:pending.id,rerung:true,pushSent:push.sent||0,expiresAt:pending.ringExpiresAt}));
-          return sendJson(res,200,{ok:true,rerung:true,call:publicCall(pending),push});
-        }catch(error){
-          console.warn('[incoming-ring]',JSON.stringify({callId:pending.id,rerung:true,error:String(error?.message||error)}));
-          return sendJson(res,503,{ok:false,error:String(error.message||error),call:publicCall(pending)});
+        let push=null,pushError=null;
+        if(!pending.ringAcknowledgedAt){
+          clearIncomingPushRetry(pending);pending.ringPushCount=Number(pending.ringPushCount||0)+1;storage.save(pending);
+          try{
+            push=await pushIncomingCall(pending);
+            console.log('[incoming-ring]',JSON.stringify({callId:pending.id,rerung:true,attempt:pending.ringPushCount,pushSent:push.sent||0,expiresAt:pending.ringExpiresAt}));
+          }catch(error){
+            pushError=String(error?.message||error);
+            console.warn('[incoming-ring]',JSON.stringify({callId:pending.id,rerung:true,attempt:pending.ringPushCount,error:pushError,expiresAt:pending.ringExpiresAt}));
+          }
+          scheduleIncomingPushRetry(pending);
         }
+        return sendJson(res,200,{ok:true,rerung:true,retrying:shouldRetryIncomingPush(pending),acknowledged:!!pending.ringAcknowledgedAt,call:publicCall(pending),push,pushError});
       }
-      const call=createCall('incoming',TTS_MODEL,incomingTone());call.ringReason=reason;call.ringExpiresAt=new Date(Date.now()+INCOMING_RING_MS).toISOString();storage.save(call);armIncomingTimeout(call);
+      const call=createCall('incoming',TTS_MODEL,incomingTone());call.ringReason=reason;call.ringExpiresAt=new Date(Date.now()+INCOMING_RING_MS).toISOString();call.ringPushCount=1;storage.save(call);armIncomingTimeout(call);
+      let push=null,pushError=null;
       try{
-        const push=await pushIncomingCall(call);
-        console.log('[incoming-ring]',JSON.stringify({callId:call.id,rerung:false,pushSent:push.sent||0,expiresAt:call.ringExpiresAt}));
-        return sendJson(res,201,{ok:true,call:publicCall(call),push});
+        push=await pushIncomingCall(call);
+        console.log('[incoming-ring]',JSON.stringify({callId:call.id,rerung:false,attempt:1,pushSent:push.sent||0,expiresAt:call.ringExpiresAt}));
+      }catch(error){
+        pushError=String(error?.message||error);
+        console.warn('[incoming-ring]',JSON.stringify({callId:call.id,rerung:false,attempt:1,error:pushError,expiresAt:call.ringExpiresAt}));
       }
-      catch(error){finishIncomingRing(call,'push_failed');return sendJson(res,503,{ok:false,error:String(error.message||error),call:publicCall(call)});}
+      scheduleIncomingPushRetry(call);
+      return sendJson(res,201,{ok:true,retrying:shouldRetryIncomingPush(call),call:publicCall(call),push,pushError});
     }
     const internalCancel=pathname.match(/^\/internal\/ring\/([0-9a-f-]{36})\/cancel$/i);
     if(req.method==='POST'&&internalCancel){
@@ -873,6 +1215,10 @@ const server=http.createServer(async(req,res)=>{
       res.write('retry: 1500\n\n');call.subscribers.add(res);
       const last=Number(req.headers['last-event-id']);
       if(Number.isFinite(last)&&last>0)for(const e of call.events.filter(e=>e.id>last))res.write('id: '+e.id+'\nevent: '+e.type+'\ndata: '+JSON.stringify(e)+'\n\n');
+      res.write('event: call_snapshot\ndata: '+JSON.stringify(publicCall(call))+'\n\n');
+      if(!(last>0)&&(call.napAlarm?.wakeTurnId||call.wakeSession?.lastTurnId)){
+        for(const e of call.events.filter(e=>e.turnId===call.turnId&&e.generation===call.generation&&['tts_segment','assistant_done'].includes(e.type)))res.write('event: '+e.type+'\ndata: '+JSON.stringify(e)+'\n\n');
+      }
       const keep=setInterval(()=>res.write(': keepalive\n\n'),15000);
       req.on('close',()=>{clearInterval(keep);call.subscribers.delete(res);});
       return;
@@ -881,6 +1227,7 @@ const server=http.createServer(async(req,res)=>{
     if(trtcSession&&req.method==='POST'){
       const call=calls.get(trtcSession[1]);if(!call)return sendJson(res,404,{error:'unknown_call'});
       if(call.endedAt||!['LISTENING','WAITING_MODEL','WAITING_TTS','ASSISTANT_SPEAKING','INTERRUPTING'].includes(call.state))return sendJson(res,409,{error:'call_not_active'});
+      if(call.napAlarm?.active)return sendJson(res,409,{error:'nap_listening_disabled'});
       const session=tencentTrtc.session(call.id);
       if(!session)return sendJson(res,503,{error:'tencent_trtc_not_configured',status:tencentTrtc.status()});
       return sendJson(res,200,{ok:true,...session});
@@ -901,7 +1248,7 @@ const server=http.createServer(async(req,res)=>{
       fs.writeFileSync(metaTmp,JSON.stringify({callId:call.id,utteranceId,sampleRate,pcmFile,bytes:pcm.length,createdAt:new Date().toISOString()}),{encoding:'utf8',mode:0o600});fs.renameSync(metaTmp,metaTarget);
       return sendJson(res,202,{ok:true,queued:true});
     }
-    const action=pathname.match(/^\/api\/calls\/([0-9a-f-]+)\/(answer|opening|presence|stt-token|stt|nonverbal|text|playback|hangup|provider-usage)$/i);
+    const action=pathname.match(/^\/api\/calls\/([0-9a-f-]+)\/(answer|ring-ack|opening|presence|stt-token|stt|nonverbal|text|nap|playback|hangup|provider-usage)$/i);
     if(action&&req.method==='POST'){
       const call=calls.get(action[1]);if(!call)return sendJson(res,404,{error:'unknown_call'});
       if(action[2]==='provider-usage'){
@@ -909,8 +1256,15 @@ const server=http.createServer(async(req,res)=>{
         return sendJson(res,200,{ok:true,recorded:PROVIDER_USAGE_ENABLED&&providerUsage.record({...body,callId:call.id}),disabled:!PROVIDER_USAGE_ENABLED});
       }
       if(action[2]==='answer'){
-        if(call.state==='RINGING'){clearTimeout(call.ringTimer);call.ringTimer=null;call.startedAt=new Date().toISOString();state(call,'LISTENING');}
+        if(call.direction==='incoming'&&call.state==='RINGING'&&Date.parse(call.ringExpiresAt)<=Date.now())finishIncomingRing(call,'missed_call');
+        call.ringPushAbort?.abort();
+        if(call.state==='RINGING'){clearTimeout(call.ringTimer);call.ringTimer=null;clearIncomingPushRetry(call);call.ringPushInFlight=false;call.startedAt=new Date().toISOString();state(call,'LISTENING');}
         return sendJson(res,200,{ok:true,call:publicCall(call)});
+      }
+      if(action[2]==='ring-ack'){
+        const body=await readJson(req);
+        const acknowledged=acknowledgeIncomingRing(call,String(body.state||'visible'));
+        return sendJson(res,200,{ok:true,acknowledged,call:publicCall(call)});
       }
       if(action[2]==='opening'){
         if(call.direction!=='incoming')return sendJson(res,409,{error:'not_incoming_call'});
@@ -927,7 +1281,25 @@ const server=http.createServer(async(req,res)=>{
         if(presence.eligible&&call.state==='LISTENING'&&!call.activeAbort)scheduleFollowup(call);
         return sendJson(res,200,{ok:true,visible,muted,followupEligible:!!presence.eligible});
       }
+      if(action[2]==='nap'){
+        const body=await readJson(req),kind=String(body.action||'');
+        if(call.state==='RINGING'||call.state==='ENDED'||call.endedAt)return sendJson(res,409,{error:'call_not_active'});
+        if(kind==='cancel'){
+          const cancelled=cancelNapAlarm(call,String(body.reason||'manual_wake'));
+          return sendJson(res,200,{ok:true,cancelled,napAlarm:napAlarmPublic(call.napAlarm)});
+        }
+        if(kind==='set'||kind==='snooze'){
+          if(call.wakeSession?.active)return sendJson(res,409,{error:'wake_negotiation_required'});
+          const minutes=Number(body.minutes||0),requested=Number(body.wakeAt||0);
+          const wakeAt=Number.isFinite(requested)&&requested>Date.now()?requested:(Date.now()+minutes*60000);
+          if(!Number.isFinite(wakeAt)||wakeAt-Date.now()<30000||wakeAt-Date.now()>24*60*60*1000)return sendJson(res,400,{error:'invalid_nap_time'});
+          armNapAlarm(call,{wakeAt,sourceText:String(body.sourceText||''),mode:kind});
+          return sendJson(res,200,{ok:true,napAlarm:napAlarmPublic(call.napAlarm)});
+        }
+        return sendJson(res,400,{error:'unknown_nap_action'});
+      }
       if(action[2]==='stt-token'){
+        if(call.napAlarm?.active||call.endedAt)return sendJson(res,409,{error:'listening_disabled'});
         const body=await readJson(req);
         const provider=String(body.provider||'scribe');
         if(provider==='assemblyai')return sendJson(res,200,{provider,token:await issueAssemblyToken()});
@@ -946,14 +1318,16 @@ const server=http.createServer(async(req,res)=>{
         if(type==='provider_state'){
           const provider=String(body.provider||''),phase=String(body.phase||'');
           if(!['assemblyai','tencent','scribe'].includes(provider)||!['ready','failed','closed'].includes(phase))return sendJson(res,400,{error:'invalid_provider_state'});
-          if(phase!=='ready')call.quietHangup?.activity(now);
-          return sendJson(res,200,{ok:true});
+          const entry={id:randomUUID(),speaker:'system',type:'stt_provider_state',provider,phase,code:String(body.code||'').replace(/[^a-zA-Z0-9_. -]/g,'').slice(0,80),at:new Date().toISOString()};
+          call.transcript.push(entry);if(phase!=='ready')call.quietHangup?.activity(now);storage.save(call);
+          console.log('[stt-provider]',JSON.stringify({callId:call.id,...entry}));return sendJson(res,200,{ok:true});
         }
         if(type==='diagnostic'){
           const d=body.diagnostic&&typeof body.diagnostic==='object'?body.diagnostic:{};
           call.sttDiagnostics={provider:String(d.provider||'').slice(0,80),label:String(d.label||'').slice(0,120),settings:d.settings&&typeof d.settings==='object'?d.settings:{},bodyHearingEnabled:!!d.bodyHearingEnabled,at:String(d.at||new Date().toISOString())};
           storage.save(call);return sendJson(res,200,{ok:true});
         }
+        if(call.napAlarm?.active||call.endedAt)return sendJson(res,409,{error:'listening_disabled'});
         if(type==='voice_start'){noteFollowupUserActivity(call,now);call.turnManager.onVoiceStart(now);return sendJson(res,200,{ok:true});}
         if(type==='partial'){
           if(text)noteFollowupUserActivity(call,now);
@@ -1009,7 +1383,8 @@ const server=http.createServer(async(req,res)=>{
         if(call.state==='RINGING')return sendJson(res,409,{error:'call_not_answered'});
         if(call.state==='ENDED')return sendJson(res,409,{error:'call_ended'});
         noteFollowupUserActivity(call,now);
-        const repair=shouldRepairTyped({lastVoiceInput:call.lastVoiceInput,now,state:call.state,text});
+        const directNap=parseNapCommand(text,{now,active:!!(call.napAlarm?.active||call.wakeSession?.active)});
+        const repair=directNap?null:shouldRepairTyped({lastVoiceInput:call.lastVoiceInput,now,state:call.state,text});
         if(repair){
           const prior={...call.lastVoiceInput};
           const entry=call.transcript.find(item=>item?.id===prior.transcriptId&&item?.speaker==='user');
@@ -1037,15 +1412,31 @@ const server=http.createServer(async(req,res)=>{
       }
       if(action[2]==='playback'){
         const body=await readJson(req);
-        if(body.status==='start'&&call.state!=='ENDED'){clearFollowupTimer(call);state(call,'ASSISTANT_SPEAKING');}
+        if(!acceptPlaybackReport(call,body))return sendJson(res,200,{ok:true,ignored:true,state:call.state});
+        if(body.status==='end'&&body.completed===true&&call.napAlarm?.active&&Number(call.napAlarm.wakeTurnId)===call.turnId){call.napAlarm.phase='playing';clearNapPushTimer(call);}
+        if(body.status==='failed'){
+          if(call.playbackFailedTurn===call.turnId)return sendJson(res,200,{ok:true});call.playbackFailedTurn=call.turnId;clearNapPushTimer(call);
+          if(call.napAlarm?.active){call.napAlarm.phase='playback_failed';pushNapAlarmNotification(call).catch(()=>{});}
+          if(call.wakeSession?.active){call.wakeSession.pendingSnooze=null;call.wakeSession.phase='listening';scheduleWakeReminder(call);}
+          state(call,'LISTENING');return sendJson(res,200,{ok:true,state:call.state});
+        }
+        if(body.status==='start'&&call.state!=='ENDED'){
+          if(call.napAlarm?.active&&Number(call.napAlarm.wakeTurnId)===Number(call.turnId)){call.napAlarm.phase='playing';clearNapPushTimer(call);storage.save(call);}
+          call.playbackStartedTurn=call.turnId;clearFollowupTimer(call);state(call,'ASSISTANT_SPEAKING');
+        }
         if(body.status==='end'&&call.state!=='ENDED'&&!call.activeAbort){
-          state(call,'LISTENING');call.quietHangup?.playbackEnded(call.turnId);call.followupState?.markPlaybackEnd();scheduleFollowup(call);
+          const finishedNapWake=!!(call.napAlarm?.active&&call.napAlarm.phase==='playing'&&Number(call.napAlarm.wakeTurnId)===Number(call.turnId));
+          const finishedWakeReply=!!(call.wakeSession?.active&&call.wakeSession.phase==='replying'&&Number(call.wakeSession.lastTurnId)===Number(call.turnId));
+          call.playbackEndedTurn=call.turnId;state(call,'LISTENING');call.quietHangup?.playbackEnded(call.turnId);call.followupState?.markPlaybackEnd();
+          if(finishedNapWake)beginWakeSession(call);
+          else if(finishedWakeReply)completeWakeReply(call,call.turnId);
+          scheduleFollowup(call);
         }
         return sendJson(res,200,{ok:true,state:call.state});
       }
       if(action[2]==='hangup'){
         if(call.endedAt)return sendJson(res,200,{ok:true,call:publicCall(call)});
-        const body=await readJson(req);clearTimeout(call.ringTimer);call.ringTimer=null;clearTimeout(call.nonverbalFlushTimer);call.nonverbalFlushTimer=null;clearFollowupTimer(call);interrupt(call,String(body.reason||'user_hangup'));
+        const body=await readJson(req);call.ringPushAbort?.abort();clearTimeout(call.ringTimer);call.ringTimer=null;clearTimeout(call.nonverbalFlushTimer);call.nonverbalFlushTimer=null;clearFollowupTimer(call);clearNapTimer(call);clearNapPushTimer(call);clearWakeTimer(call);clearIncomingPushRetry(call);call.ringPushInFlight=false;interrupt(call,String(body.reason||'user_hangup'));
         call.state='ENDED';call.endedAt=new Date().toISOString();
         call.transcript.push({id:randomUUID(),speaker:'system',type:'hangup',reason:String(body.reason||'user_hangup'),at:call.endedAt});
         storage.save(call);event(call,'state',{state:'ENDED'});queueCallEndNotification(call,String(body.reason||'user_hangup'));
@@ -1120,7 +1511,7 @@ async function considerQuietHangup(call){
 function tickQuietHangups(){
   const now=Date.now();
   for(const call of calls.values()){
-    const g=call.quietHangup;if(!g||call.endedAt||call.state==='RINGING')continue;
+    const g=call.quietHangup;if(!g||call.endedAt||call.state==='RINGING'||call.napAlarm?.active||call.wakeSession?.active)continue;
     if(!g.available(now)){g.activity(now);continue;}
     if(g.phase==='warning'&&now-g.warningAt>120000){g.activity(now);continue;}
     if(call.state!=='LISTENING'||call.activeAbort)continue;
@@ -1131,6 +1522,18 @@ function tickQuietHangups(){
   }
 }
 const quietHangupTimer=setInterval(tickQuietHangups,1000);quietHangupTimer.unref?.();
+for(const saved of recoverableCalls){
+  const call=createCall(saved.direction,saved.ttsModel,saved.ttsTone,saved);
+  if(call.state==='RINGING'){
+    if(Date.parse(call.ringExpiresAt||'')<=Date.now())finishIncomingRing(call,'missed_call');
+    else{armIncomingTimeout(call);scheduleIncomingPushRetry(call,0);}
+  }else{
+    call.state='LISTENING';
+    if(call.napAlarm?.active){call.napAlarm.phase='sleeping';call.napAlarm.wakeTurnId=null;const alarm=call.napAlarm;call.napTimer=setTimeout(()=>{if(call.napAlarm===alarm)triggerNapAlarm(call).catch(error=>failCallTurn(call,error));},Math.max(0,Date.parse(alarm.wakeAt)-Date.now()));}
+    else if(call.wakeSession?.active){call.wakeSession.phase='listening';call.wakeSession.pendingSnooze=null;call.wakeSession.lastTurnId=null;scheduleWakeReminder(call);}
+    storage.save(call);
+  }
+}
+
 server.listen(PORT,HOST,()=>console.log('companion-voice-runtime listening on '+HOST+':'+PORT));
 process.on('SIGTERM',()=>{clearInterval(retentionTimer);clearInterval(emotionShadowTimer);clearInterval(quietHangupTimer);codex.stop();server.close(()=>process.exit(0));});
-

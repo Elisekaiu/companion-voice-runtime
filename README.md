@@ -76,14 +76,6 @@ The runtime persists transcript structure, call duration, assistant audio segmen
 
 The browser client includes recovery paths for the things mobile Safari routinely interrupts: audio contexts, microphone tracks, STT connections, page visibility, and return-from-background behavior. It can also reconnect to an already-active call after a page reload/PWA restart, prevents a second overlapping active call from being created, and checks the server when the event stream disappears so stale call UI can close cleanly. A manual microphone reconnect path remains available when the OS wins.
 
-### Frontend responsiveness and cleanup
-
-The client reuses loaded TTS configuration and existing transcript bubble nodes instead of refetching configuration on every dial or rebuilding each bubble on every text delta. Short acknowledgements keep their punctuation on one line; closing quotes stay with their sentence.
-
-Recognizer sockets that close during startup fail immediately instead of waiting for the handshake timeout. Cancelled call startup cannot attach a late recognizer to a different call. Interrupted playback releases its audio nodes, failed incoming calls run full cleanup, and Tencent microphone clones stop locally before network teardown completes. Muting clears the recognition pre-roll buffer.
-
-These changes leave conversational silence thresholds unchanged. They remove avoidable frontend work and failure-path waits, but do not guarantee a particular end-to-end latency across devices or providers.
-
 ### Idle STT sleep / wake
 
 Long calls can contain long stretches of real silence. The reference hybrid path now uses **light sleep** instead of putting every recognizer to sleep at once:
@@ -99,6 +91,18 @@ Long calls can contain long stretches of real silence. The reference hybrid path
 - manual mute still shuts the recognition paths down deliberately.
 
 This avoids making soft speech depend on a local volume threshold while still reducing idle AssemblyAI session time.
+
+### Nap / wake mode
+
+A live call can enter an explicit nap state when the user asks to be woken after a relative duration or at a Hong Kong clock time. While the nap is active, realtime listening is intentionally shut down instead of billing cloud recognizers through silence. The browser shows a compact countdown/status pill plus a manual early-wake control, and active-call recovery restores the nap without accidentally reopening STT.
+
+At the deadline, the server starts a real companion wake turn. Listening reopens only after the wake audio has actually finished playing. If playback never starts, an optional push-service hook can send a fallback notification. After waking, a bounded wake session can allow a short snooze for ordinary naps or refuse snooze for clearly time-critical commitments; reminder count and intervals remain server-bounded. See [docs/NAP_AND_WAKE.md](docs/NAP_AND_WAKE.md) for the lifecycle and failure guards.
+
+### Incoming-call and fallback hardening
+
+Incoming calls now use a bounded ringing window with retryable push delivery. Retries stop when the visible call surface acknowledges the ring, and answer/hangup paths abort in-flight retry work so stale notifications do not keep arriving.
+
+Tencent TRTC failures now preserve the provider's extra diagnostic code when available. Hybrid fallback keeps AssemblyAI awake after a Tencent failure, retries Tencent with backoff, and only resets that backoff after Tencent has remained healthy for a stability window. The public UI exposes the useful fallback state without dumping provider internals into the normal call experience.
 
 ### Optional Usage Center
 

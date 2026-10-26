@@ -12,7 +12,7 @@ test('hybrid idle sleep keeps Tencent awake while AssemblyAI sleeps',()=>{
 });
 
 test('Tencent failure wakes AssemblyAI, retries Tencent, then permits light sleep after stability',()=>{
-  assert.ok(app.includes("if(phase==='failed'){scribe?.noteTencentFailed?.();scribe?.recoverRecognition?.();scribe?.recoverTencent?.();}"));
+  assert.ok(app.includes("if(phase==='failed'&&!napMode){scribe?.noteTencentFailed?.();scribe?.recoverRecognition?.();scribe?.recoverTencent?.();}"));
   assert.ok(app.includes("else if(event?.state==='started'){reportSttState('tencent','ready')"));
   assert.ok(app.includes('FALLBACK_KEEP_AWAKE_MS=90000'));
   assert.ok(app.includes('TENCENT_STABLE_BEFORE_SLEEP_MS=30000'));
