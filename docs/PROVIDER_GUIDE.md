@@ -24,6 +24,28 @@ Companion Voice Runtime 使用的是一套**参考实现**，不是在宣称某�
 
 官方参考：<https://trtc.io/document/80841>
 
+#### 免费额度说明（2026 年 10 月核对）
+
+Tencent 国际站的 **Tencent RTC** 当前计费文档写的是：AI Recognition / RTC 试用体系有 **每个账号每月 10,000 分钟免费额度**。AI Recognition 计费页把这类免费分钟描述为 Speech-to-Text、AI Real-Time Translation、Text-to-Speech 之间共享；另外一些 Tencent RTC 官方页面则把它描述成首年 / free trial 额度。
+
+所以更稳妥的理解是：**国际站目前有很可观的 10,000 分钟/月免费试用额度，但具体持续时间、资格和你账号能否领取，以注册时控制台显示为准。**
+
+中国大陆的 **腾讯云 ASR** 则是另一套产品 / API 体系，免费额度也不是“10,000 分钟”：
+
+- **一句话识别：每月 5,000 次成功调用**
+- **实时语音识别：每月 5 小时**
+- 一句话识别单次音频最长 60 秒，和实时流式识别不是同一个接口、也不是同一个计费口径
+
+所以不要把“国内每月 5,000 次”理解成“实时电话可以免费 5,000 个 turn”；我们这种 live call 更应该看实时语音识别 / RTC 的时长额度。
+
+国际 Tencent RTC 和国内腾讯云 ASR 在注册、地域、API、资源包和计费上都可能不同，接入前请直接看对应站点和自己账号控制台。
+
+官方参考：
+- <https://trtc.io/document/67832>
+- <https://trtc.io/solutions/conversational-ai>
+- <https://cloud.tencent.com/document/product/1093/35686>
+- <https://cloud.tencent.com/document/product/1093/35802>
+
 ### 主 / 通用路径：AssemblyAI Universal-3.6 Pro Realtime
 
 参考 hybrid 客户端使用 AssemblyAI `universal-3-6-pro` 作为主 realtime stream / turn clock；没有 Tencent 时也可以单独运行。
@@ -31,6 +53,29 @@ Companion Voice Runtime 使用的是一套**参考实现**，不是在宣称某�
 AssemblyAI 把 Universal-3.6 Pro Realtime 定位在 voice-agent / telephony 对话，强调短 utterance、噪声 / 电话音频、口音，以及多语言 / code-switching 等 realtime 场景。
 
 官方参考：<https://www.assemblyai.com/blog/universal-3-6-pro-realtime>
+
+#### Bonus 纠偏层：先用 keyterms，再考虑本地替换
+
+Universal-3.6 Pro Realtime 原生支持 **keyterms prompting**，目前不额外收费。AssemblyAI 文档写的是 streaming 最多大约 **100 个 term**，而且可以在 session 进行中动态更新。
+
+它很适合放：人名、产品名、缩写、口头词、行业词，或者你自己反复发现“总是听错”的词。
+
+`agent_context` 则是另一层：它告诉 realtime 模型当前对话在讲什么；keyterms 负责把具体词汇锚住。两者可以叠加。
+
+注意：**keyterms 是提高模型正确识别这些词的概率，不是强制 X→Y 替换。** AssemblyAI 另外还有一个叫 Custom Spelling 的概念，比较接近 transcript 完成后的 find-and-replace，但不要和 realtime keyterms 混成同一个功能。
+
+如果 live call 里仍然存在少量、稳定、反复出现的错词，可以在自己的部署里再加一个很小的本地 replacement map：
+
+```text
+长期观察到的错词 -> 想要的词
+```
+
+这层很适合保持私有，因为里面往往是个人名字、口头词或专属词汇。只放真正反复出现的错误，不要拿它做大范围“同义词替换”；太激进会把本来正确的 transcript 也改坏。AssemblyAI 自己也提醒过，keyterm list 过长同样可能反过来伤害准确率，所以最好 A/B 测，而不是越多越安心。
+
+官方参考：
+- <https://www.assemblyai.com/blog/fix-language-steering-streaming-transcription>
+- <https://www.assemblyai.com/blog/real-time-transcription-python>
+- <https://www.assemblyai.com/blog/when-keyterm-prompting-backfires>
 
 ### 额外替代：ElevenLabs Scribe v2 Realtime
 

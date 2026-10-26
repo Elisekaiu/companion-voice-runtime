@@ -24,20 +24,15 @@ Companion Voice Runtime 是一个可自托管的 AI 陪伴语音层，包含实�
 
 参考 hybrid 路径仍以 AssemblyAI `universal-3-6-pro` 作为主 realtime stream / turn clock；它可以单独工作。
 
-如果你的通话以中文为主，**最推荐额外启用 Tencent Cloud 中文实时识别**。腾讯这条链更专注实时中文/RTC 场景，很适合优先拿来测试短句、日常聊天式普通话。这里说的是实际适配方向，**不是在声称它和微信使用同一套识别模型**。
+如果你的通话以中文为主，**最推荐额外启用 Tencent Cloud 中文实时识别**。腾讯这条链更专注实时中文 / RTC 场景，很适合拿来补短句、日常聊天式普通话。这里说的是实际适配方向，**不是在声称它和微信使用同一套识别模型**。
 
-配置 Tencent 后，两家 STT 可以并行监听，`web/stt-arbiter.js` 只选择一份最终 transcript。ElevenLabs Scribe v2 Realtime 仍可作为额外替代路径。双线不是必须；它只是让两个失败模式不同的识别器互相兜底。
+AssemblyAI 自己也有一层很好用的原生纠偏：Universal-3.6 Pro Realtime 支持 `keyterms_prompt` 和 `agent_context`。如果只是某些名字、口头词、缩写或固定词反复听错，可以先用 keyterms / context 提示模型。再顽固的、长期稳定出现的错词，可以在自己的部署里加一个**很小的本地 X→Y replacement map**作为最后兜底。
 
-这版还把“provider final”和“用户整句话结束”分开处理：
+这个 replacement map 最好保持私人、保持很小，只放自己真的反复观察到的错误；不要把它做成一大堆“同义词替换”，否则正确 transcript 也可能被误伤。
 
-- provider 的 final 只视为一个 ASR segment
-- `web/stt-turn-buffer.js` 等待真正的对话停顿再提交
-- 短暂停顿后继续说话不会立刻被切成两轮
-- 晚到的 Tencent / AssemblyAI segment 仍可并入同一轮
-- 重复 final 会去重
-- 最终只向 companion 提交一次
+配置 Tencent 后，两家 STT 可以并行监听，`web/stt-arbiter.js` 只选择一份最终 transcript。ElevenLabs Scribe v2 Realtime 仍可作为额外替代路径。双线不是必须，它只是让失败模式不同的识别器互相兜底。
 
-这样比单纯把 provider 的 endpoint 当作用户说完更耐真实聊天里的停顿。
+provider 自己的 `final` 也不会直接等于“用户整句话说完”：`web/stt-turn-buffer.js` 会等待真正的对话停顿，合并晚到 segment、去掉重复 final，最终只向 companion 提交一次。
 
 ### 3. 有限度的自主续聊
 
@@ -319,8 +314,10 @@ npm test
 
 ## 状态
 
-这是从真实个人系统中整理出来的公开版本，不是托管产品，也不是“一键上线”的电话服务。
+这是一个**还在真实使用里继续长出来的个人项目**，从自己的长期系统里整理成公开版本；它不是托管产品，也不是“一键上线”的电话服务。
 
-Provider 配置、移动浏览器行为和可选外部 adapter 仍可能有棱角。
+维护方式其实很朴素：真的拿来打电话，遇到哪里不对，尽量复现，再修。也正因为这样，**不能保证完全没有 bug**，也不能保证每一种浏览器、provider、地区、账号配置或说话习惯都一样稳定。
+
+持续使用里碰到能复现的问题，通常会在修好并测试后尽快同步到 repo。更适合把它当作一份真实可跑的参考实现，然后用你自己的手机、浏览器、麦克风和 provider 再测试一遍；重要部署也记得保留回滚和恢复能力。
 
 如果你基于它继续做，请保留 provenance / attribution 链条。它也是这个项目的一部分。
