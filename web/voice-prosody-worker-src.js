@@ -62,8 +62,9 @@ function finishTurn(requestId){
   let summary=null;
   try{summary=analyzeProsody(floats,{sampleRate:SAMPLE_RATE});}
   catch(error){postMessage({type:'error',message:String(error?.message||error)});}
+  const pcmBuffer=merged.buffer;
   resetTurn();
-  postMessage({type:'summary',requestId,summary});
+  postMessage({type:'summary',requestId,summary,pcmBuffer},[pcmBuffer]);
 }
 
 self.onmessage=event=>{

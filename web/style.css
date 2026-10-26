@@ -387,3 +387,13 @@ main{position:relative;margin:auto;max-width:760px}
   .usage-meter-track{background:rgba(20,25,32,.07)}
   #room-toast{background:#fff;color:#171a20;border-color:rgba(20,25,32,.08);box-shadow:0 10px 35px rgba(20,25,32,.12)}
 }
+
+.emotion-shadow-note{
+  margin-top:7px;
+  font-size:10px;
+  line-height:1.55;
+  letter-spacing:.02em;
+  color:rgba(190,174,194,.48);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+.memory-msg.user .emotion-shadow-note{text-align:right}
