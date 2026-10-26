@@ -14,6 +14,7 @@ import { sanitizeVoiceTone, describeVoiceTone, voiceToneContext } from './call/v
 import { CallStorage } from './call/storage.mjs';
 import { TencentTrtcConfig } from './call/tencent-trtc.mjs';
 import { FollowupState } from './call/followup.mjs';
+import { QuietHangup, parseQuietDecision } from './call/quiet-hangup.mjs';
 import { isVoiceReason, shouldRepairTyped, mergeRepairText, repairContext } from './call/turn-repair.mjs';
 import { CodexAppServer } from './codex/app-server.mjs';
 import { createProviderUsage } from './provider-usage.mjs';
@@ -25,9 +26,14 @@ const ROOT=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../web');
 const DATA_DIR=process.env.CALL_DATA_DIR||'/data/calls';
 const RECORDINGS_DIR=process.env.CALL_RECORDINGS_DIR||path.join(path.dirname(DATA_DIR),'recordings');
 const TURN_AUDIO_DIR=process.env.CALL_TURN_AUDIO_DIR||path.join(path.dirname(DATA_DIR),'call-turn-audio');
+const EMOTION_SHADOW_ENABLED=/^(1|true|yes)$/i.test(String(process.env.EMOTION_SHADOW_ENABLED||''));
+const EMOTION_SHADOW_DIR=process.env.EMOTION_SHADOW_DIR||path.join(path.dirname(DATA_DIR),'emotion-shadow');
+const EMOTION_SHADOW_INBOX=path.join(EMOTION_SHADOW_DIR,'inbox');
+const EMOTION_SHADOW_RESULTS=path.join(EMOTION_SHADOW_DIR,'results');
 const VOICE_RETENTION_DAYS=90;
 const VOICE_RETENTION_MS=VOICE_RETENTION_DAYS*24*60*60*1000;
 fs.mkdirSync(TURN_AUDIO_DIR,{recursive:true});
+if(EMOTION_SHADOW_ENABLED){fs.mkdirSync(EMOTION_SHADOW_INBOX,{recursive:true});fs.mkdirSync(EMOTION_SHADOW_RESULTS,{recursive:true});}
 const CODEX_MODEL=process.env.CODEX_MODEL||'gpt-5.6-sol';
 const CODEX_EFFORT=process.env.CODEX_EFFORT||'medium';
 const VOICE_ID=String(process.env.ELEVENLABS_VOICE_ID||'').trim();
@@ -124,11 +130,20 @@ async function readJson(req){
   let data='';for await(const chunk of req){data+=chunk;if(data.length>256000)throw new Error('request_too_large');}
   return data?JSON.parse(data):{};
 }
+async function readBinary(req,maxBytes=1200000){
+  const chunks=[];let total=0;
+  for await(const chunk of req){total+=chunk.length;if(total>maxBytes)throw new Error('request_too_large');chunks.push(chunk);}
+  return Buffer.concat(chunks,total);
+}
 function publicCall(call){
   return {id:call.id,state:call.state,direction:call.direction,ttsTone:call.ttsTone,voiceProfile:call.intimacy?.active?'intimate':'normal',createdAt:call.createdAt,startedAt:call.startedAt,endedAt:call.endedAt,ringExpiresAt:call.ringExpiresAt||null,ringReason:call.ringReason||null,generation:call.generation,turnId:call.turnId,ttsModel:call.ttsModel,transcript:call.transcript};
 }
 function currentActiveCall(){
   return [...calls.values()].filter(call=>!call.endedAt&&call.state!=='ENDED').sort((a,b)=>Date.parse(b.startedAt||b.createdAt||0)-Date.parse(a.startedAt||a.createdAt||0))[0]||null;
+}
+function emotionShadowWorkerReady(){
+  if(!EMOTION_SHADOW_ENABLED)return false;
+  try{return Date.now()-fs.statSync(path.join(EMOTION_SHADOW_DIR,'worker-heartbeat.json')).mtimeMs<15000;}catch{return false;}
 }
 function callDurationMs(call){
   if(!call.startedAt)return null;
@@ -223,7 +238,7 @@ function deleteCallArchive(id){
   fs.rmSync(file+'.tmp',{force:true});fs.rmSync(file,{force:true});
 }
 function createCall(direction='outgoing',ttsModel=TTS_MODEL,ttsTone='original'){
-  const call={id:randomUUID(),direction,ttsModel,ttsTone,state:'RINGING',createdAt:new Date().toISOString(),startedAt:null,endedAt:null,generation:0,turnId:0,codexThreadId:null,title:null,transcript:[],audioSegments:[],events:[],nextEventId:0,subscribers:new Set(),segments:new Map(),turnManager:new TurnManager(),intimacy:new IntimacyState(),followupState:new FollowupState(),followupTimer:null,lastVoiceInput:null,pendingRepair:null,finalizeTimer:null,activeAbort:null,activeCodexTurnId:null,activeInputReason:null,performanceState:new PerformanceState(),performanceCues:new Map(),performanceCueSent:new Set(),nonverbalLastSeen:Object.create(null),nonverbalPendingKeys:new Set(),pendingNonverbalDetails:[],nonverbalFlushTimer:null,pendingVoiceTone:null,pendingSttProvider:null,pendingSttCandidates:null,ringExpiresAt:null,ringReason:null,ringTimer:null,postCallDeliveryPending:false,postCallNotifyReason:null,postCallNotifiedAt:null};
+  const call={id:randomUUID(),direction,ttsModel,ttsTone,state:'RINGING',createdAt:new Date().toISOString(),startedAt:null,endedAt:null,generation:0,turnId:0,codexThreadId:null,title:null,transcript:[],audioSegments:[],events:[],nextEventId:0,subscribers:new Set(),segments:new Map(),turnManager:new TurnManager(),intimacy:new IntimacyState(),followupState:new FollowupState(),followupTimer:null,lastVoiceInput:null,pendingRepair:null,finalizeTimer:null,activeAbort:null,activeCodexTurnId:null,activeInputReason:null,performanceState:new PerformanceState(),performanceCues:new Map(),performanceCueSent:new Set(),nonverbalLastSeen:Object.create(null),nonverbalPendingKeys:new Set(),pendingNonverbalDetails:[],nonverbalFlushTimer:null,pendingVoiceTone:null,pendingSttProvider:null,pendingSttCandidates:null,pendingSttUtteranceId:null,quietHangup:new QuietHangup(),ringExpiresAt:null,ringReason:null,ringTimer:null,postCallDeliveryPending:false,postCallNotifyReason:null,postCallNotifiedAt:null};
   calls.set(call.id,call);storage.save(call);return call;
 }
 function incomingTone(){
@@ -270,6 +285,22 @@ function event(call,type,data={}){
   for(const res of call.subscribers){try{res.write(wire);}catch{call.subscribers.delete(res);}}
   return payload;
 }
+function consumeEmotionShadowResults(){
+  if(!EMOTION_SHADOW_ENABLED)return;
+  let files=[];try{files=fs.readdirSync(EMOTION_SHADOW_RESULTS).filter(name=>/^[0-9a-f-]{36}__[0-9a-f-]{36}\.json$/i.test(name));}catch{return;}
+  for(const name of files.slice(0,30)){
+    const file=path.join(EMOTION_SHADOW_RESULTS,name);
+    try{
+      const raw=JSON.parse(fs.readFileSync(file,'utf8'));
+      const callId=String(raw.callId||''),utteranceId=String(raw.utteranceId||''),call=calls.get(callId);
+      const entry=call?.transcript?.find(item=>item?.speaker==='user'&&item?.utteranceId===utteranceId);
+      if(!call||!entry){if(Date.now()-fs.statSync(file).mtimeMs>60000)fs.rmSync(file,{force:true});continue;}
+      const top=Array.isArray(raw.top)?raw.top.slice(0,3).map(item=>({label:String(item?.label||'').slice(0,80),score:Number(Math.max(0,Math.min(1,Number(item?.score)||0)).toFixed(6))})).filter(item=>item.label):[];
+      const shadow={model:'emotion2vec_plus_base',durationMs:Math.max(0,Math.min(60000,Number(raw.durationMs)||0)),inferenceMs:Math.max(0,Math.min(60000,Number(raw.inferenceMs)||0)),top,at:String(raw.at||new Date().toISOString()).slice(0,40)};
+      entry.emotionShadow=shadow;storage.save(call);event(call,'emotion_shadow',{utteranceId,model:shadow.model,inferenceMs:shadow.inferenceMs,top:shadow.top});fs.rmSync(file,{force:true});
+    }catch{try{if(Date.now()-fs.statSync(file).mtimeMs>60000)fs.rmSync(file,{force:true});}catch{}}
+  }
+}
 function state(call,value){call.state=value;storage.save(call);event(call,'state',{state:value});}
 function clearFollowupTimer(call){
   if(!call)return;
@@ -278,6 +309,7 @@ function clearFollowupTimer(call){
 function noteFollowupUserActivity(call,now=Date.now()){
   clearFollowupTimer(call);
   call.followupState?.resetByUser(now);
+  call.quietHangup?.userActivity(now);
 }
 function scheduleFollowup(call){
   clearFollowupTimer(call);
@@ -557,8 +589,8 @@ async function processTurn(call,text,reason){
     call.transcript.push({id:randomUUID(),speaker:'system',type:'typed_repair',turnId,text:String(repair?.typedText||''),reason,at:new Date().toISOString(),repairOfTurnId:repair?.priorTurnId||null});
     storage.save(call);
   }else{
-    const userEntry={id:randomUUID(),speaker:'user',turnId,text,reason,at:new Date().toISOString(),...(isVoiceReason(reason)&&call.pendingSttProvider?{sttProvider:call.pendingSttProvider}:{}),...(isVoiceReason(reason)&&call.pendingSttCandidates?{sttCandidates:call.pendingSttCandidates}:{})};
-    call.pendingSttProvider=null;call.pendingSttCandidates=null;
+    const userEntry={id:randomUUID(),speaker:'user',turnId,text,reason,at:new Date().toISOString(),...(isVoiceReason(reason)&&call.pendingSttProvider?{sttProvider:call.pendingSttProvider}:{}),...(isVoiceReason(reason)&&call.pendingSttCandidates?{sttCandidates:call.pendingSttCandidates}:{}),...(isVoiceReason(reason)&&call.pendingSttUtteranceId?{utteranceId:call.pendingSttUtteranceId}:{})};
+    call.pendingSttProvider=null;call.pendingSttCandidates=null;call.pendingSttUtteranceId=null;
     call.transcript.push(userEntry);
     if(isVoiceReason(reason))call.lastVoiceInput={transcriptId:userEntry.id,turnId,responseTurnId:turnId,text,at:Date.now(),reason};
     else call.lastVoiceInput=null;
@@ -686,7 +718,7 @@ const server=http.createServer(async(req,res)=>{
     const url=new URL(req.url,'http://localhost');
     const pathname=url.pathname.replace(/^\/call(?=\/|$)/,'')||'/';
 
-    if(req.method==='GET'&&pathname==='/health')return sendJson(res,200,{ok:true,service:'companion-voice-runtime',version:'0.4.0',mode:'voice-pipeline',codexReady,codexMode:USE_COMPANION_BRIDGE?'companion-bridge':'dedicated',codexModel:USE_COMPANION_BRIDGE?(bridgeCodexInfo.model||'companion-bridge'):CODEX_MODEL,codexEffort:USE_COMPANION_BRIDGE?(bridgeCodexInfo.effort||'bridge'):CODEX_EFFORT,codexThreadId:USE_COMPANION_BRIDGE?(bridgeCodexInfo.threadId||null):null,sttReady:!!(ASSEMBLYAI_API_KEY||ELEVENLABS_API_KEY),sttProviders:{assemblyai:!!ASSEMBLYAI_API_KEY,scribe:!!ELEVENLABS_API_KEY,tencent:tencentTrtc.status().configured},ttsReady:!!ELEVENLABS_API_KEY,calls:calls.size});
+    if(req.method==='GET'&&pathname==='/health')return sendJson(res,200,{ok:true,service:'companion-voice-runtime',version:'0.4.0',mode:'voice-pipeline',codexReady,codexMode:USE_COMPANION_BRIDGE?'companion-bridge':'dedicated',codexModel:USE_COMPANION_BRIDGE?(bridgeCodexInfo.model||'companion-bridge'):CODEX_MODEL,codexEffort:USE_COMPANION_BRIDGE?(bridgeCodexInfo.effort||'bridge'):CODEX_EFFORT,codexThreadId:USE_COMPANION_BRIDGE?(bridgeCodexInfo.threadId||null):null,sttReady:!!(ASSEMBLYAI_API_KEY||ELEVENLABS_API_KEY),sttProviders:{assemblyai:!!ASSEMBLYAI_API_KEY,scribe:!!ELEVENLABS_API_KEY,tencent:tencentTrtc.status().configured},ttsReady:!!ELEVENLABS_API_KEY,emotionShadow:{enabled:EMOTION_SHADOW_ENABLED,ready:emotionShadowWorkerReady()},calls:calls.size});
     if(req.method==='GET'&&pathname==='/internal/preflight'){
       if(!authorizedVoiceBridge(req))return sendJson(res,401,{error:'unauthorized_voice_bridge'});
       if(!PUSH_SERVICE_URL)return sendJson(res,503,{ok:false,error:'push_service_not_configured'});
@@ -817,7 +849,7 @@ const server=http.createServer(async(req,res)=>{
       res.writeHead(200,{'content-type':'audio/mpeg','content-length':data.length,'cache-control':'private, no-store'});
       res.end(data);return;
     }
-    if(req.method==='GET'&&pathname==='/api/stt/providers')return sendJson(res,200,{providers:{assemblyai:!!ASSEMBLYAI_API_KEY,scribe:!!ELEVENLABS_API_KEY},default:ASSEMBLYAI_API_KEY?'assemblyai':'scribe'});
+    if(req.method==='GET'&&pathname==='/api/stt/providers')return sendJson(res,200,{providers:{assemblyai:!!ASSEMBLYAI_API_KEY,scribe:!!ELEVENLABS_API_KEY},default:ASSEMBLYAI_API_KEY?'assemblyai':'scribe',emotionShadow:{enabled:EMOTION_SHADOW_ENABLED,ready:emotionShadowWorkerReady()}});
 
     if(req.method==='POST'&&pathname==='/api/calls'){
       const active=currentActiveCall();
@@ -853,6 +885,22 @@ const server=http.createServer(async(req,res)=>{
       if(!session)return sendJson(res,503,{error:'tencent_trtc_not_configured',status:tencentTrtc.status()});
       return sendJson(res,200,{ok:true,...session});
     }
+    const emotionShadow=pathname.match(/^\/api\/calls\/([0-9a-f-]{36})\/emotion-shadow$/i);
+    if(emotionShadow&&req.method==='POST'){
+      const call=calls.get(emotionShadow[1]);if(!call)return sendJson(res,404,{error:'unknown_call'});
+      if(!EMOTION_SHADOW_ENABLED||!emotionShadowWorkerReady())return sendJson(res,503,{error:'emotion_shadow_unavailable'});
+      if(call.endedAt||call.state==='ENDED')return sendJson(res,409,{error:'call_ended'});
+      let pending=[];try{pending=fs.readdirSync(EMOTION_SHADOW_INBOX).filter(name=>name.endsWith('.json'));}catch{}
+      if(pending.length>=20)return sendJson(res,503,{error:'emotion_shadow_busy'});
+      const utteranceId=String(req.headers['x-utterance-id']||'');if(!/^[0-9a-f-]{36}$/i.test(utteranceId))return sendJson(res,400,{error:'invalid_utterance_id'});
+      const sampleRate=Number(req.headers['x-sample-rate']||16000);if(sampleRate!==16000)return sendJson(res,400,{error:'unsupported_sample_rate'});
+      const pcm=await readBinary(req,1200000);if(pcm.length<3200||pcm.length%2!==0)return sendJson(res,400,{error:'invalid_pcm'});
+      const base=call.id+'__'+utteranceId,pcmFile=base+'.pcm',pcmTarget=path.join(EMOTION_SHADOW_INBOX,pcmFile),pcmTmp=pcmTarget+'.tmp';
+      fs.writeFileSync(pcmTmp,pcm,{mode:0o600});fs.renameSync(pcmTmp,pcmTarget);
+      const metaTarget=path.join(EMOTION_SHADOW_INBOX,base+'.json'),metaTmp=metaTarget+'.tmp';
+      fs.writeFileSync(metaTmp,JSON.stringify({callId:call.id,utteranceId,sampleRate,pcmFile,bytes:pcm.length,createdAt:new Date().toISOString()}),{encoding:'utf8',mode:0o600});fs.renameSync(metaTmp,metaTarget);
+      return sendJson(res,202,{ok:true,queued:true});
+    }
     const action=pathname.match(/^\/api\/calls\/([0-9a-f-]+)\/(answer|opening|presence|stt-token|stt|nonverbal|text|playback|hangup|provider-usage)$/i);
     if(action&&req.method==='POST'){
       const call=calls.get(action[1]);if(!call)return sendJson(res,404,{error:'unknown_call'});
@@ -873,6 +921,7 @@ const server=http.createServer(async(req,res)=>{
       }
       if(action[2]==='presence'){
         const body=await readJson(req),visible=body.visible!==false,muted=!!body.muted;
+        call.quietHangup?.presence({enabled:body.quietHangupEnabled,healthy:body.hearingHealthy,visible,muted,engaged:body.engaged});
         const presence=call.followupState?.setPresence({visible,muted})||{eligible:false};
         clearFollowupTimer(call);
         if(presence.eligible&&call.state==='LISTENING'&&!call.activeAbort)scheduleFollowup(call);
@@ -894,6 +943,12 @@ const server=http.createServer(async(req,res)=>{
       }
       if(action[2]==='stt'){
         const body=await readJson(req),type=String(body.type||''),text=String(body.text||'').trim(),now=Date.now();
+        if(type==='provider_state'){
+          const provider=String(body.provider||''),phase=String(body.phase||'');
+          if(!['assemblyai','tencent','scribe'].includes(provider)||!['ready','failed','closed'].includes(phase))return sendJson(res,400,{error:'invalid_provider_state'});
+          if(phase!=='ready')call.quietHangup?.activity(now);
+          return sendJson(res,200,{ok:true});
+        }
         if(type==='diagnostic'){
           const d=body.diagnostic&&typeof body.diagnostic==='object'?body.diagnostic:{};
           call.sttDiagnostics={provider:String(d.provider||'').slice(0,80),label:String(d.label||'').slice(0,120),settings:d.settings&&typeof d.settings==='object'?d.settings:{},bodyHearingEnabled:!!d.bodyHearingEnabled,at:String(d.at||new Date().toISOString())};
@@ -916,7 +971,8 @@ const server=http.createServer(async(req,res)=>{
             call.sttUtterances??=new Set();
             if(call.sttUtterances.has(utteranceId))return sendJson(res,200,{ok:true,duplicate:true});
             call.sttUtterances.add(utteranceId);if(call.sttUtterances.size>800)call.sttUtterances.delete(call.sttUtterances.values().next().value);
-          }
+            call.pendingSttUtteranceId=utteranceId;
+          }else call.pendingSttUtteranceId=null;
           call.pendingSttProvider=['assemblyai','tencent','scribe'].includes(body.provider)?body.provider:null;
           const candidates=body.candidates&&typeof body.candidates==='object'?body.candidates:null;
           call.pendingSttCandidates=candidates?{assemblyai:String(candidates.assemblyai||'').slice(0,500),tencent:String(candidates.tencent||'').slice(0,500)}:null;
@@ -926,10 +982,10 @@ const server=http.createServer(async(req,res)=>{
             const kind=call.turnManager.classifyBargeIn({text,voiceDurationMs:Number(body.voiceDurationMs||0)});
             if(kind==='backchannel'){
               call.intimacy.noteNonverbal(text);
-              call.pendingVoiceTone=null;call.turnManager.reset();event(call,'backchannel',{text});
+              call.pendingVoiceTone=null;call.pendingSttProvider=null;call.pendingSttCandidates=null;call.pendingSttUtteranceId=null;call.turnManager.reset();event(call,'backchannel',{text});
               return sendJson(res,200,{ok:true,classification:kind,remembered:true});
             }
-            if(kind==='ignore'){call.pendingVoiceTone=null;call.turnManager.reset();return sendJson(res,200,{ok:true,classification:kind});}
+            if(kind==='ignore'){call.pendingVoiceTone=null;call.pendingSttProvider=null;call.pendingSttCandidates=null;call.pendingSttUtteranceId=null;call.turnManager.reset();return sendJson(res,200,{ok:true,classification:kind});}
             if(call.state==='WAITING_MODEL'&&call.activeInputReason==='typed'&&kind==='interrupt'){
               const explicit=call.turnManager.isExplicitInterrupt(text),duration=Number(body.voiceDurationMs||0);
               if(!explicit&&(duration<900||text.length<4)){call.pendingVoiceTone=null;call.turnManager.reset();return sendJson(res,200,{ok:true,classification:'ignore',protectedTypedTurn:true});}
@@ -975,7 +1031,7 @@ const server=http.createServer(async(req,res)=>{
           return sendJson(res,202,{ok:true,classification:'typed_repair',repairOfTurnId:prior.turnId});
         }
         if(call.activeAbort||['WAITING_MODEL','WAITING_TTS','ASSISTANT_SPEAKING','INTERRUPTING'].includes(call.state))interrupt(call,'typed_turn');
-        call.pendingVoiceTone=null;call.turnManager.reset();call.lastVoiceInput=null;
+        call.pendingVoiceTone=null;call.pendingSttProvider=null;call.pendingSttCandidates=null;call.pendingSttUtteranceId=null;call.turnManager.reset();call.lastVoiceInput=null;
         processTurn(call,text,'typed').catch(error=>failCallTurn(call,error));
         return sendJson(res,202,{ok:true,classification:'typed'});
       }
@@ -983,7 +1039,7 @@ const server=http.createServer(async(req,res)=>{
         const body=await readJson(req);
         if(body.status==='start'&&call.state!=='ENDED'){clearFollowupTimer(call);state(call,'ASSISTANT_SPEAKING');}
         if(body.status==='end'&&call.state!=='ENDED'&&!call.activeAbort){
-          state(call,'LISTENING');call.followupState?.markPlaybackEnd();scheduleFollowup(call);
+          state(call,'LISTENING');call.quietHangup?.playbackEnded(call.turnId);call.followupState?.markPlaybackEnd();scheduleFollowup(call);
         }
         return sendJson(res,200,{ok:true,state:call.state});
       }
@@ -1039,6 +1095,42 @@ const server=http.createServer(async(req,res)=>{
 
 try{const pruned=pruneExpiredTurnAudio();if(pruned.removed)console.log('call audio retention pruned '+pruned.removed+' segment(s)');}catch(error){console.warn('call audio retention startup prune failed',error?.message||error);}
 const retentionTimer=setInterval(()=>{try{pruneExpiredTurnAudio();}catch(error){console.warn('call audio retention prune failed',error?.message||error);}},24*60*60*1000);retentionTimer.unref?.();
+const emotionShadowTimer=setInterval(()=>{try{consumeEmotionShadowResults();}catch{}},700);emotionShadowTimer.unref?.();
+
+async function considerQuietHangup(call){
+  const guard=call.quietHangup,revision=guard.begin();if(revision===null)return;
+  clearFollowupTimer(call);
+  const recent=call.transcript.filter(item=>(item?.speaker==='user'||item?.speaker==='assistant')&&String(item?.text||'').trim()).slice(-12).map(item=>(item.speaker==='user'?'User':'Companion')+': '+String(item.text).replace(/\s+/g,' ').slice(0,280)).join('\n').slice(-2800);
+  const abort=new AbortController();call.activeAbort=abort;call.activeInputReason='quiet_hangup_decision';state(call,'WAITING_MODEL');
+  const timeout=setTimeout(()=>abort.abort(),15000);
+  try{
+    const control='<call_context>This is a call-control decision, not a new message from User. The browser reports that the call is visible, unmuted, and speech recognition is healthy, while User has been silent and has not typed for at least five minutes. Use the recent call context below.\n\nRecent call:\n'+(recent||'(no recent visible turns)')+'\n\nReturn JSON only. If User has asked for continued quiet presence (for example: stay with me, keep me company while I study/work/sleep, do not hang up, just stay on the line) and has not cancelled that request, return {"action":"stay_until_activity"}. If the call should continue but there is no durable presence request, return {"action":"stay","recheck_after_minutes":30}; choose 10-180 minutes when context suggests another interval. Only if the conversation clearly appears to have naturally ended should you return {"action":"end_after_silence","message":"one short natural confirmation saying you will wait one more minute and then end the call if there is still no response"}. Do not claim the user is asleep. This request cannot directly end the call; the server will enforce another grace period.</call_context>';
+    const result=await streamCompanionBridgeTurn(control,{signal:abort.signal});
+    const decision=parseQuietDecision(result.text);if(call.endedAt)return;
+    if(decision?.action==='stay_until_activity'){if(guard.revision===revision)guard.defer({untilActivity:true});return;}
+    if(decision?.action==='stay'){if(guard.revision===revision)guard.defer({minutes:decision.recheckAfterMinutes});return;}
+    if(decision?.action!=='end_after_silence'||!guard.accept(revision,call.turnId+1)){if(guard.revision===revision)guard.defer({minutes:30});return;}
+    const turnId=++call.turnId;
+    call.transcript.push({id:randomUUID(),speaker:'system',type:'quiet_hangup_requested',turnId,at:new Date().toISOString()});
+    call.transcript.push({id:randomUUID(),speaker:'assistant',turnId,text:decision.message,at:new Date().toISOString()});
+    addTtsSegment(call,decision.message,turnId,call.generation);event(call,'assistant_done',{text:decision.message,ttsAvailable:!!ELEVENLABS_API_KEY});state(call,'WAITING_TTS');
+  }catch{if(guard.revision===revision)guard.defer({minutes:30});}
+  finally{clearTimeout(timeout);if(call.activeAbort===abort){call.activeAbort=null;call.activeInputReason=null;if(call.state==='WAITING_MODEL')state(call,'LISTENING');}}
+}
+function tickQuietHangups(){
+  const now=Date.now();
+  for(const call of calls.values()){
+    const g=call.quietHangup;if(!g||call.endedAt||call.state==='RINGING')continue;
+    if(!g.available(now)){g.activity(now);continue;}
+    if(g.phase==='warning'&&now-g.warningAt>120000){g.activity(now);continue;}
+    if(call.state!=='LISTENING'||call.activeAbort)continue;
+    if(g.canAsk(now)){considerQuietHangup(call).catch(()=>g.activity());continue;}
+    if(!g.canEnd(now))continue;
+    clearFollowupTimer(call);interrupt(call,'companion_quiet_hangup');call.state='ENDED';call.endedAt=new Date().toISOString();
+    call.transcript.push({id:randomUUID(),speaker:'system',type:'hangup',reason:'companion_quiet_hangup',at:call.endedAt});storage.save(call);event(call,'state',{state:'ENDED',reason:'companion_quiet_hangup'});queueCallEndNotification(call,'companion_quiet_hangup');
+  }
+}
+const quietHangupTimer=setInterval(tickQuietHangups,1000);quietHangupTimer.unref?.();
 server.listen(PORT,HOST,()=>console.log('companion-voice-runtime listening on '+HOST+':'+PORT));
-process.on('SIGTERM',()=>{clearInterval(retentionTimer);codex.stop();server.close(()=>process.exit(0));});
+process.on('SIGTERM',()=>{clearInterval(retentionTimer);clearInterval(emotionShadowTimer);clearInterval(quietHangupTimer);codex.stop();server.close(()=>process.exit(0));});
 
