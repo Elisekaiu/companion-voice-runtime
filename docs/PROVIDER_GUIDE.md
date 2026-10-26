@@ -94,7 +94,7 @@ partial timeout:       4200 ms
 
 The exact provider endpointing settings are less important than the rule above: **provider final != conversation final**.
 
-Re-test these values for your own speaking pace. Very aggressive endpointing feels fast in a demo and terrible in a real conversation.
+Re-test these values for your own speaking pace. Very aggressive endpointing feels fast in a demo and terrible in a real conversation. The current arbiter has one targeted fast path: once Tencent has a finalized Chinese hypothesis, it keeps the 1.6-second conversational-silence guard but does not wait the full 4.2-second partial timeout solely for a stale unfinished AssemblyAI partial.
 
 ## Light-sleep cost control
 
@@ -106,7 +106,9 @@ The current hybrid client uses **light sleep**:
 - if Tencent is configured, Tencent stays online as the wake path;
 - a Tencent transcript can wake AssemblyAI, so soft speech does not have to cross a local volume threshold first;
 - the local RMS speech gate remains a backup wake signal;
-- roughly three seconds of microphone pre-roll are retained and sent to AssemblyAI after reconnect;
+- roughly six seconds of microphone pre-roll are retained and sent to AssemblyAI after reconnect;
+- if Tencent fails during a call, AssemblyAI is woken immediately while Tencent is retried in the background;
+- after a fallback event, AssemblyAI stays awake for a short stability lease and Tencent must remain healthy before light sleep is allowed again;
 - if Tencent is not available, automatic AssemblyAI sleep is skipped rather than making quiet speech depend on the local gate;
 - manual mute still shuts recognition down deliberately.
 
@@ -119,6 +121,22 @@ An older design put every cloud recognizer to sleep after 30 seconds and relied 
 That saves more connection time, but quiet speech can fall below a local amplitude threshold. Keeping the Chinese sidecar awake gives the runtime a semantic wake signal instead of asking a simple volume gate to decide whether a soft voice was speech.
 
 If your provider pricing or privacy requirements make this tradeoff unattractive, disable the optimization or change which provider stays awake.
+
+## Prosody is not emotion detection
+
+A terminology correction: the browser `voice-prosody` path in this repository is **DSP/prosody analysis**, not a learned speech-emotion-recognition model. It measures observable acoustics (level, voiced time, pauses, pitch/F0 movement, speaking rate and personal-baseline differences). Those are useful features, but they do not justify claims such as “the user is sad” or “the user is nervous.”
+
+Earlier project wording sometimes called this “voice tone” in a way that could be read as emotion detection. That was too broad, and the UI/docs now use more precise language.
+
+### Optional experiment: emotion2vec+ base
+
+For deployments with spare CPU/RAM, the repository includes an optional local shadow worker using `emotion2vec_plus_base`. The model card describes a roughly 90M-parameter SER model fine-tuned with about 4,788 hours of data and a 9-class output. See <https://huggingface.co/emotion2vec/emotion2vec_plus_base>.
+
+We have **not yet used this long enough in real calls to claim that it improves companion behavior**. The reference integration therefore keeps it in shadow mode: it runs after the utterance, displays/stores bounded scores for comparison, and does not feed those scores into the companion prompt.
+
+On one 2-vCPU / 8-GB-RAM / no-GPU VPS, warm inference for a ~4.1-second sample was about 0.9–1.2 seconds, steady model RSS was around 1 GB, and cold loading briefly approached ~3 GB. Treat these as one-machine observations, not universal requirements. Small VPS deployments should leave it disabled unless they have measured headroom.
+
+See [EMOTION_SHADOW.md](EMOTION_SHADOW.md) for setup and privacy behavior.
 
 ## TTS
 

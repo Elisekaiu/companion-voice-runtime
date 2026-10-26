@@ -40,6 +40,10 @@ Silence does not have to end the relationship or turn the companion into an infi
 
 Companion Voice Runtime supports autonomous follow-up turns with a strict cadence and cap. Real user activity resets the cadence; mute, hidden/inactive call surfaces, and interruptions pause or cancel it. The companion can continue a quiet call, but it cannot chatter forever just because the timer fired.
 
+An optional **smart quiet-hangup guard** handles the other direction: after a long healthy silence, the model may advise the server to stay, defer the next check, stay quietly until the user becomes active again, or ask once before ending. The model never gets direct hangup authority. A server-side state machine verifies browser/STT health, invalidates stale decisions on new user activity, and enforces a final grace period before an autonomous hangup.
+
+Continued-presence requests such as “stay with me,” “keep me company while I study/work,” “stay on the line while I sleep,” or equivalent context can resolve to `stay_until_activity`, which suppresses repetitive periodic check-ins until the user speaks or types again.
+
 ### Cross-channel continuity
 
 A call can be another surface of the same companion instead of a separate bot session.
@@ -52,7 +56,11 @@ No private chat integration is shipped in this repository.
 
 Companion Voice Runtime can attach local perceptual cues to the exact assistant turn that consumed them.
 
-On-device workers can derive environmental/nonverbal audio events and prosodic facts such as level, approximate pitch, pitch variation, pauses, speaking rate, and ending trend. Hearing v2 uses YAMNet in the browser through ONNX Runtime Web. YAMNet scores **521 AudioSet classes** on roughly **0.96-second windows with 50% overlap**, which makes it useful for low-latency event cues without uploading raw microphone audio to a separate sound-classification service.
+On-device workers can derive environmental/nonverbal audio events and prosodic facts such as level, approximate pitch, pitch variation, pauses, speaking rate, and ending trend. **Correction:** the existing “voice tone” path is a DSP/prosody analyzer, not a learned emotion detector. Earlier wording could imply more than it actually does. It describes acoustic change and personal-baseline differences; it does not reliably infer a person's internal emotional state.
+
+For deployments that want to experiment with a real speech-emotion-recognition model, the repository now includes an **optional emotion2vec+ shadow sidecar**. It runs asynchronously, does not block the normal reply path, and does not feed its labels into the companion by default. We have only just started real-use evaluation, so it is included as an experiment rather than a recommendation. See [docs/EMOTION_SHADOW.md](docs/EMOTION_SHADOW.md).
+
+Hearing v2 uses YAMNet in the browser through ONNX Runtime Web. YAMNet scores **521 AudioSet classes** on roughly **0.96-second windows with 50% overlap**, which makes it useful for low-latency event cues without uploading raw microphone audio to a separate sound-classification service.
 
 The public hearing catalog expands beyond a handful of intimate/nonverbal cues to ordinary sounds such as music, rain, wind, footsteps, typing, doors, doorbells, pets, traffic, trains, aircraft, cooking, dishes, running water, appliances, alarms, sirens, coughing, sneezing, and laughter. Short salient events can be reactive; persistent ambience is remembered as context without repeatedly forcing the companion to speak.
 
@@ -76,7 +84,9 @@ Long calls can contain long stretches of real silence. The reference hybrid path
 - when Tencent is configured, Tencent stays online as the low-cost/low-friction wake path;
 - a Tencent transcript can wake AssemblyAI even when the speaker is too quiet for the local RMS gate;
 - the local speech gate remains only as a backup wake signal;
-- roughly three seconds of pre-roll are retained and sent to AssemblyAI after reconnect;
+- roughly six seconds of pre-roll are retained and sent to AssemblyAI after reconnect;
+- a Tencent failure immediately wakes/keeps AssemblyAI available while the client retries Tencent in the background;
+- after a fallback event, AssemblyAI is kept awake for a stability lease, and Tencent must remain healthy before AssemblyAI is allowed to light-sleep again;
 - if Tencent is unavailable, the reference client does not automatically put AssemblyAI to sleep, preferring recognition reliability over the cost optimization;
 - manual mute still shuts the recognition paths down deliberately.
 
@@ -152,7 +162,8 @@ See [docs/PROVIDER_GUIDE.md](docs/PROVIDER_GUIDE.md) for model/provider reasonin
 
 mic PCM ──▶ YAMNet worker ──────┐
         └─▶ prosody worker ─────┼─▶ turn-scoped perception context
-                                └─▶ durable "heard cues" metadata
+        └─▶ emotion2vec shadow ─┤   (optional; not in prompt by default)
+                                └─▶ durable cue/shadow metadata
 ```
 
 ## Main pieces
@@ -160,12 +171,14 @@ mic PCM ──▶ YAMNet worker ──────┐
 - `src/call/turn-manager.mjs` — turn-taking and interruption semantics
 - `src/call/turn-repair.mjs` — typed repair of recent voice turns
 - `src/call/followup.mjs` — bounded autonomous follow-up cadence
+- `src/call/quiet-hangup.mjs` — model-advised, server-authorized quiet-call ending guard
 - `src/call/speech-segmenter.mjs` — stable text segmentation for TTS
 - `src/call/voice-tone.mjs` — bounded voice-tone context for the model
 - `src/call/performance-cue.mjs` — expressive cue state machine
 - `web/stt-arbiter.js` — realtime transcript arbitration
 - `web/body-hearing-worker-src.js` — browser-side nonverbal event inference
-- `web/voice-prosody-core.js` — local acoustic/prosodic analysis
+- `web/voice-prosody-core.js` — local acoustic/prosodic analysis (not emotion classification)
+- `tools/emotion-shadow-worker.py` — optional local emotion2vec+ shadow classifier
 - `web/app.js` — PWA call lifecycle, playback, history, recovery, and UI
 
 ## Requirements
@@ -177,6 +190,7 @@ mic PCM ──▶ YAMNet worker ──────┐
 - ElevenLabs API access for the default TTS path
 - AssemblyAI API access for the default realtime STT path
 - Optional Tencent TRTC credentials for the Chinese realtime sidecar
+- Optional Python 3.11 + PyTorch/FunASR and additional RAM for the emotion2vec+ shadow experiment
 
 External services have their own terms, pricing, regions, and account requirements. This repository does not bundle service credentials.
 
@@ -257,9 +271,9 @@ See [`web/sfx/README.md`](web/sfx/README.md).
 ## Privacy notes
 
 - Runtime call data belongs under `data/` and is ignored by Git.
-- Raw microphone audio is not persisted by default.
+- Raw microphone audio is not persisted by default. The optional emotion2vec shadow briefly queues per-utterance PCM on the self-hosted machine and deletes it after inference.
 - Archived assistant audio and call metadata may be stored locally when the relevant features are enabled.
-- Browser-side YAMNet/prosody analysis stays on-device; only bounded cue metadata is passed into the conversation pipeline.
+- Browser-side YAMNet/prosody analysis stays on-device; only bounded cue metadata is passed into the conversation pipeline. The optional emotion2vec shadow is deliberately excluded from the companion prompt until a deployment chooses otherwise.
 - API keys and access tokens must never be committed.
 
 Before deploying publicly, review `docs/OPERATIONS.md` and put the application behind authentication and HTTPS.
@@ -270,7 +284,7 @@ Before deploying publicly, review `docs/OPERATIONS.md` and put the application b
 npm test
 ```
 
-The current suite covers turn-taking, repair behavior, STT arbitration, speech segmentation, follow-up cadence, voice-tone analysis, archive behavior, Tencent session configuration, expressive cue state, and related call-runtime contracts.
+The current suite covers turn-taking, repair behavior, STT arbitration, speech segmentation, follow-up cadence, quiet-hangup guards, prosody analysis, optional emotion-shadow contracts, archive behavior, Tencent session configuration, expressive cue state, and related call-runtime contracts.
 
 ## Standing on shoulders
 
