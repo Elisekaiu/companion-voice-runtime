@@ -9,6 +9,7 @@ export class CallStorage {
       schema:2,id:call.id,direction:call.direction,state:call.state,createdAt:call.createdAt,
       startedAt:call.startedAt,endedAt:call.endedAt,generation:call.generation,turnId:call.turnId,
       ttsModel:call.ttsModel||null,ttsTone:call.ttsTone||null,ringExpiresAt:call.ringExpiresAt||null,ringReason:call.ringReason||null,
+      napAlarm:call.napAlarm||null,wakeSession:call.wakeSession||null,ringAcknowledgedAt:call.ringAcknowledgedAt||null,ringPushCount:call.ringPushCount||0,
       codexThreadId:call.codexThreadId||null,title:call.title||null,transcript:call.transcript,audioSegments:Array.isArray(call.audioSegments)?call.audioSegments:[]
     },null,2);
     const target=this.file(call.id), temp=target+'.tmp';

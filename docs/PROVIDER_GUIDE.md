@@ -134,6 +134,8 @@ Realtime STT 连接在没人说话时仍可能累积 session 时间。
 
 如果浏览器 / 网络异常导致 AssemblyAI 没有正常发送 termination 用量，客户端还会用本地已发送音频时间做 fallback 记录。**Provider 自己的账单仍是最终权威，本地 Usage 只是估算。**
 
+Tencent 故障排查时，运行时还会保留 SDK 给出的有限 `error` 和 `extraCode`。这些值只用于 diagnostics，不应该直接占据正常通话界面：用户侧只需要知道 fallback 已接管，日志里再保留足够的 provider code 去区分配置、房间、网络或服务错误。重试退避也不会在一次短暂的 ready 后立刻清零，而是要求 Tencent 连续健康一个稳定窗口。
+
 ## Prosody 不是情绪识别
 
 这里补一个术语更正：仓库原来的 browser `voice-prosody` 路径是 **DSP / prosody analysis**，不是 learned speech-emotion-recognition model。它测的是音量、voiced time、停顿、F0 / pitch 变化、语速和个人 baseline 差异；这些是可观察的声学事实，但不能直接证明“用户悲伤 / 紧张 / 兴奋”。

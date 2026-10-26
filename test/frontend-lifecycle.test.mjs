@@ -23,7 +23,7 @@ test('early recognizer close rejects immediately and removes handshake listeners
 test('interrupted speech disconnects its gain and analyser even after current source changes',async()=>{
  let disconnected=0,meterStopped=0;
  const audioSource={playbackRate:{},connect(){},disconnect(){disconnected++;},start(){context.currentSource=null;queueMicrotask(()=>this.onended());}};
- const context=vm.createContext({audioGeneration:1,currentSource:null,currentCallPlaybackRate:1,api:async()=>{},audioNote(){},room:{measure:()=>()=>meterStopped++},audioCtx:{state:'running',resume:async()=>{},createBufferSource:()=>audioSource,createGain:()=>({gain:{},connect(){},disconnect(){disconnected++;}})},playPerformanceCue:async()=>false});
+ const context=vm.createContext({audioGeneration:1,currentSource:null,currentCallPlaybackRate:1,playbackTurn:null,playbackStarted:false,api:async()=>{},audioNote(){},room:{measure:()=>()=>meterStopped++},audioCtx:{state:'running',resume:async()=>{},createBufferSource:()=>audioSource,createGain:()=>({gain:{},connect(){},disconnect(){disconnected++;}})},playPerformanceCue:async()=>false});
  vm.runInContext(extract('async function playPreparedAudio','function maybeFinishPlayback'),context);
  await context.playPreparedAudio(Promise.resolve({buffer:{duration:1},playbackRate:1,voiceProfile:'normal',id:'test'}),1);
  assert.ok(disconnected>=2);assert.ok(meterStopped>=1);

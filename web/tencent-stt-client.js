@@ -40,13 +40,24 @@ export async function startTencentTranscriber({
         robotId:String(event?.transcriberRobotId||robotId||''),
         sourceLanguage:String(event?.sourceLanguage||'zh'),
         error:Number(event?.error)||0,
+        extraCode:Number(event?.extraCode)||0,
         errorMessage:String(event?.errorMessage||'')
       });
+    }catch(error){onError(error);}
+  };
+  const handleError=event=>{
+    try{
+      const error=new Error(String(event?.message||event?.errorMessage||'Tencent TRTC error'));
+      error.code=Number(event?.code)||0;
+      error.extraCode=Number(event?.extraCode)||0;
+      error.data=event?.data||null;
+      onError(error);
     }catch(error){onError(error);}
   };
 
   trtc.on(TRTC.EVENT.REALTIME_TRANSCRIBER_MESSAGE,handleMessage);
   trtc.on(TRTC.EVENT.REALTIME_TRANSCRIBER_STATE_CHANGED,handleState);
+  trtc.on(TRTC.EVENT.ERROR,handleError);
 
   try{
     await trtc.enterRoom({

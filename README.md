@@ -105,7 +105,21 @@ Hearing v2 仍使用 YAMNet + ONNX Runtime Web 在浏览器本地跑，覆盖 52
 
 另外，若浏览器退出或网络异常导致 AssemblyAI 没有正常发回 termination 用量，客户端会用本地已发送音频时间做 fallback 记录。Provider 自己的账单仍然是最终权威，本地 Usage 只是运行时估算。
 
-### 8. 可选 Usage Center
+### 8. Nap / Wake：真的睡觉时把云端耳朵关掉
+
+在进行中的电话里，用户可以直接说“二十分钟后叫我”“晚上八点半叫我”一类明确的小睡指令。Nap 是服务端持久化的通话状态，不只是浏览器计时器：进入 Nap 后会主动关闭 realtime STT、阻止后台自动重连，并暂停自主续聊和 quiet-hangup 检查；刷新页面或 PWA 重启后也会恢复同一个 Nap 状态，而不会偷偷重新开麦。
+
+到点后由服务端发起一轮真正的 companion wake turn。只有这一轮叫醒音频确认播放完成，浏览器才重新打开 STT；如果播放始终没开始，可选 push adapter 会作为兜底通知。叫醒后还会进入一个有边界的 Wake 阶段：普通小睡可以允许有限 snooze，考试、航班、预约或“别让我赖床”这类明确紧急条件会建立 strict floor，模型不能擅自把它放宽。
+
+详见 [docs/NAP_AND_WAKE.md](docs/NAP_AND_WAKE.md)。
+
+### 9. 来电与 fallback 更耐断线
+
+主动来电现在使用有上限的 ringing window，并支持 push 重试；一旦可见通话页 ACK 了来电，重试会立即停止，接听和挂断也会取消仍在途的 push，避免旧通知继续弹。
+
+Tencent TRTC 出错时会保留 provider 返回的 `error` / `extraCode` 作为诊断信息。fallback 会让 AssemblyAI 立刻保持在线，同时按退避策略重连 Tencent；只有 Tencent 连续健康一段稳定窗口后，重试计数才真正归零并再次允许 AssemblyAI 进入 Light Sleep。正常通话 UI 只显示“正在使用 fallback”，不会把内部错误码倾倒给用户。
+
+### 10. 可选 Usage Center
 
 如果你会盯额度，可以开启用量卡片；如果看额度反而焦虑，也可以完全关闭。
 
@@ -123,13 +137,13 @@ CALL_PROVIDER_USAGE_ENABLED=1
 
 详见 [docs/USAGE_CENTER.md](docs/USAGE_CENTER.md)。
 
-### 9. 关系风格留在部署本地
+### 11. 关系风格留在部署本地
 
 公开仓库保留 nonverbal、prosody、close/whisper 等通用能力，但不包含私人 prompt、私人录音或更私密的关系词表。
 
 你可以在自己的部署里扩展，不需要改感知主干。
 
-### 10. 自带你的 expressive audio
+### 12. 自带你的 expressive audio
 
 公开仓库不提供私人、生成或第三方 SFX 音频。
 
