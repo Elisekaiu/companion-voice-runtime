@@ -88,6 +88,8 @@ export async function startTencentTranscriber({
     async close(){
       if(closed)return;
       closed=true;
+      // Stop capturing immediately; remote plugin cleanup can take a network round trip.
+      try{ownedTrack.stop();}catch{}
       try{if(robotId)await trtc.stopPlugin('RealtimeTranscriber',{transcriberRobotId:robotId});}catch{}
       try{await trtc.stopLocalAudio();}catch{}
       try{await trtc.exitRoom();}catch{}

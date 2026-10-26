@@ -397,3 +397,12 @@ main{position:relative;margin:auto;max-width:760px}
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 .memory-msg.user .emotion-shadow-note{text-align:right}
+
+/* Keep brief acknowledgements and their punctuation together. */
+.transcript .line .words .call-bubble.short-utterance,
+.history-conversation .memory-msg .memory-words.short-utterance {
+  white-space: nowrap !important;
+  word-break: keep-all !important;
+  overflow-wrap: normal !important;
+  min-inline-size: max-content !important;
+}
