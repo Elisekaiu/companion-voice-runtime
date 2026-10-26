@@ -22,3 +22,8 @@ web/voice-prosody-worker.js
 # Prepared by npm run setup; do not commit generated third-party runtime assets.
 web/ort/
 web/models/yamnet.onnx
+
+# Optional local Python shadow-model environment
+.emotion-shadow-venv/
+__pycache__/
+*.pyc

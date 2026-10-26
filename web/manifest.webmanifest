@@ -1,6 +1,6 @@
 {
-  "name": "Companion 通话",
-  "short_name": "Companion 通话",
+  "name": "Companion Call",
+  "short_name": "Companion Call",
   "start_url": "/call/",
   "display": "standalone",
   "background_color": "#09090b",

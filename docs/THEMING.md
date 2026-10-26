@@ -1,20 +1,20 @@
-# 修改公开版 UI 主题
+# Theming the public starter UI
 
-仓库默认提供的是一套刻意保持中性的通话房间主题。
+The repository ships a deliberately neutral call-room theme.
 
-视觉层和语音 runtime 是分开的。你可以改外观，而不需要碰 STT、轮次、模型 adapter、TTS、通话历史或 perception。
+The visual layer is intentionally separate from the voice runtime. You can change the appearance without touching STT, turn-taking, model adapters, TTS, call history, or perception.
 
-## 主要文件
+## Main file
 
-编辑：
+Edit:
 
 `web/style.css`
 
-公开 stylesheet 同时包含基础布局与中性主题，所以刚 clone 下来也能直接使用，不要求额外字体或美术资产。
+The public stylesheet contains both layout and a simple neutral theme so a fresh clone is usable without additional assets or fonts.
 
-## 最容易改的地方
+## Easy customization points
 
-在 `web/style.css` 顶部修改 CSS 变量：
+At the top of `web/style.css`, change the CSS variables:
 
 ```css
 --bg
@@ -27,28 +27,28 @@
 --danger
 ```
 
-还可以替换：
+You can also replace:
 
-- Call Room 设置里的默认头像
-- 背景 preset
-- 自定义背景图
-- 字体
-- 按钮形状
-- `web/index.html` 的通话文案
-- `web/room.js` 的 foyer greeting
+- the default avatar through Call Room settings;
+- the background presets;
+- the custom background image;
+- typography;
+- button shape;
+- call-room copy in `web/index.html`;
+- the foyer greeting in `web/room.js`.
 
-用户自己选择的头像 / 背景会保存在浏览器 IndexedDB。
+User-selected avatar/background images stay in browser IndexedDB.
 
-## 不要把什么塞进主题层
+## What not to couple to the theme
 
-不要把 provider 凭据、模型 prompt、关系记忆或私人录音放进 CSS / HTML 资产。
+Avoid putting provider credentials, model prompts, relationship memory, or private recordings into CSS/HTML assets.
 
-视觉定制应与以下部分保持分离：
+Keep visual customization separate from:
 
-- `src/call/` — 轮次与通话行为
-- `web/stt-arbiter.js` — 语音仲裁
-- `web/body-hearing-worker-src.js` — 非言语检测
-- `web/voice-prosody-*` — voice-tone 分析
-- 后端模型 / provider adapters
+- `src/call/` — turn and call behavior;
+- `web/stt-arbiter.js` — speech arbitration;
+- `web/body-hearing-worker-src.js` — nonverbal detection;
+- `web/voice-prosody-*` — voice-tone analysis;
+- backend model/provider adapters.
 
-默认主题故意做得比较素，这样 fork 的人可以直接做成自己的样子，而不用先拆掉另一个人的私人审美。
+The default theme is intentionally plain so forks can make the call room their own without first removing another person's private aesthetic.

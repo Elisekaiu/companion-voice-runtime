@@ -42,3 +42,13 @@ test('candidate provenance is retained for diagnostics',()=>{
   assert.equal(out.text,'快一点');
   assert.deepEqual(out.candidates,{assemblyai:'Quiet',tencent:'快一点'});
 });
+
+test('finalized Chinese Tencent result does not wait for a stale Assembly partial',()=>{
+  const buffer=new SttTurnBuffer({silenceMs:1600,partialTimeoutMs:4200});
+  buffer.update('assemblyai',{id:'a',text:'I think you should',final:false},1000);
+  buffer.update('tencent',{id:'t',text:'我已经说完这句话了',final:true},1200);
+  assert.equal(buffer.take(2700),null);
+  const out=buffer.take(2801);
+  assert.equal(out.text,'我已经说完这句话了');
+  assert.equal(out.provider,'tencent');
+});

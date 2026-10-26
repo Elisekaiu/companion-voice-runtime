@@ -1,15 +1,7 @@
-# 运行时数据
+# Runtime data
 
-公开仓库里的这个目录故意保持为空。
+This directory is intentionally empty in the public repository.
 
-运行时，Companion Voice Runtime 可能在这里创建：
+At runtime Companion Voice Runtime may create local call metadata, archived assistant audio, Codex state, recordings, and secret files here. None of those files should be committed.
 
-- 本地通话 metadata
-- 已归档的 assistant 音频
-- Codex state
-- 录音（仅当你主动开启）
-- secret 文件
-
-这些内容都不应该被 commit。
-
-按照安装文档在 `data/secrets/` 下本地创建凭据；支持环境变量的地方，也可以改用等效环境变量。
+Create credentials locally under `data/secrets/` as described in the setup documentation, or provide equivalent environment variables where supported.

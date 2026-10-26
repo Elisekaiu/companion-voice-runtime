@@ -100,7 +100,21 @@ A copy of the ONNX Runtime license is included at:
 
 `third_party/licenses/ONNXRUNTIME-MIT.txt`
 
-## 4. Direct npm dependencies
+## 4. Optional emotion2vec+ model
+
+The optional emotion-shadow experiment can download `emotion2vec_plus_base` at runtime through FunASR / Hugging Face. The model weights are **not redistributed in this repository**.
+
+**Upstream**
+
+- emotion2vec / emotion2vec+
+- https://github.com/ddlBoJack/emotion2vec
+- https://huggingface.co/emotion2vec/emotion2vec_plus_base
+
+The model card describes `emotion2vec_plus_base` as a roughly 90M-parameter speech-emotion-recognition model. Users who enable the optional worker are responsible for reviewing the upstream model license and any dependencies downloaded by their Python environment.
+
+Companion Voice Runtime does not claim authorship of emotion2vec or its model weights.
+
+## 5. Direct npm dependencies
 
 The public source repository does not commit `node_modules/`. Installing dependencies with `npm ci` downloads packages under their own licenses.
 
@@ -117,7 +131,7 @@ Direct dependency metadata at the public-release audit:
 
 Transitive dependencies are recorded in `package-lock.json` and retain their respective upstream licenses.
 
-## 5. External services
+## 6. External services
 
 The reference implementation can call external hosted services, including ElevenLabs, AssemblyAI, Tencent TRTC/Speech services, and OpenAI services.
 
@@ -125,12 +139,12 @@ Those services are not licensed under the project's MIT license. Users are respo
 
 No service API keys are included in this repository.
 
-## 6. Expressive SFX
+## 7. Expressive SFX
 
 The public repository intentionally redistributes **no personal, generated, or third-party expressive SFX audio**.
 
 `web/real-sfx-catalog.js` is empty by default. Users who enable the optional performance layer must provide audio they have the right to use. See `web/sfx/README.md`.
 
-## 7. Inspiration-only projects
+## 8. Inspiration-only projects
 
 Projects listed in `ACKNOWLEDGEMENTS.md` but not listed above are not being relicensed by Companion Voice Runtime. Their inclusion in acknowledgements does not grant permission to copy or redistribute their code, documentation, media, or assets.

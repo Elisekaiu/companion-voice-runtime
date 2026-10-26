@@ -114,6 +114,8 @@ partial timeout:       4200 ms
 
 真实聊天里，人会停一下、想一下、再继续。把 provider 第一个 final 直接当成“整句话说完”，很容易把一句话切成两轮。
 
+当前仲裁器有一个针对性的 fast path：Tencent 已经给出 finalized 中文结果时，仍保留 1.6 秒 conversational silence 保护，但不会只为了等一个 stale AssemblyAI partial 再拖满 4.2 秒。
+
 ## Light Sleep：省空闲成本，但不牺牲轻声
 
 Realtime STT 连接在没人说话时仍可能累积 session 时间。
@@ -126,11 +128,25 @@ Realtime STT 连接在没人说话时仍可能累积 session 时间。
 - 配置了 Tencent 时，Tencent 保持在线，作为 wake path；
 - Tencent 一旦重新听到并转出语音，可以唤醒 AssemblyAI，因此很轻的声音不需要先跨过本地音量阈值；
 - 本地 RMS speech gate 仍保留，但只作为备用；
-- 约 3 秒 microphone pre-roll 会被保留，AssemblyAI 重连后优先补入；
+- 约 6 秒 microphone pre-roll 会被保留，AssemblyAI 重连后优先补入；
 - 如果 Tencent 没有可用，参考客户端不会自动让 AssemblyAI 睡掉，而是优先保证轻声识别；
 - 手动静音仍会主动关闭识别链路。
 
 如果浏览器 / 网络异常导致 AssemblyAI 没有正常发送 termination 用量，客户端还会用本地已发送音频时间做 fallback 记录。**Provider 自己的账单仍是最终权威，本地 Usage 只是估算。**
+
+## Prosody 不是情绪识别
+
+这里补一个术语更正：仓库原来的 browser `voice-prosody` 路径是 **DSP / prosody analysis**，不是 learned speech-emotion-recognition model。它测的是音量、voiced time、停顿、F0 / pitch 变化、语速和个人 baseline 差异；这些是可观察的声学事实，但不能直接证明“用户悲伤 / 紧张 / 兴奋”。
+
+### 可选实验：emotion2vec+ base
+
+如果 VPS 有多余 CPU / RAM，可以试 `emotion2vec_plus_base`。模型卡把它描述为约 90M 参数、9 类情绪输出的 SER 模型。参考：<https://huggingface.co/emotion2vec/emotion2vec_plus_base>。
+
+**我们刚接上，还没有足够真实长期使用经验判断它到底有多大用处。** 所以参考实现只把它放在 shadow mode：一句话结束后异步跑、显示/保存有限分数，不让它拖慢回复，也不默认把标签喂进 companion prompt。
+
+我们这台测试 VPS 是 2 vCPU / 8 GB RAM / 无 GPU，实测热模型常驻大约 1 GB RSS，冷加载峰值接近 3 GB；约 4.1 秒音频热推理大约 0.9–1.2 秒。**这是单机观察，不是官方硬件要求。** 小 VPS 或本来内存就紧的部署，建议不开。
+
+详见 `EMOTION_SHADOW.md`。
 
 ## TTS
 

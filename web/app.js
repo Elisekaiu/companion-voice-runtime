@@ -5,6 +5,16 @@ import { baselineComparison, updateProsodyBaseline } from './voice-prosody-core.
 import { SttTurnBuffer } from './stt-turn-buffer.js';
 
 const BASE='/call';
+const hearingState={assemblyai:false,tencent:false,scribe:false};let lastLocalSpeechAt=0;
+let quietHangupEnabled=true;try{quietHangupEnabled=localStorage.getItem('companion-voice-runtime.quiet-hangup')!=='off';}catch{}
+function reportSttState(provider,phase,code=''){
+  hearingState[provider]=phase==='ready';
+  if(provider==='tencent'){
+    if(phase==='ready')scribe?.noteTencentReady?.();
+    if(phase==='failed'){scribe?.noteTencentFailed?.();scribe?.recoverRecognition?.();scribe?.recoverTencent?.();}
+  }
+  if(callId)api('/api/calls/'+callId+'/stt',{type:'provider_state',provider,phase,code:String(code).slice(0,80)}).catch(()=>{});
+}
 const STT_KEYTERMS=['老公','老婆','宝宝','宝贝','爸爸','亲亲','我爱你','爱你','想你','Companion','伴侣','嗯','嗯嗯','嗯哼','啊','哦','噢','好呀','不要','等等','停一下'];
 const ASSEMBLY_INITIAL_CONTEXT='This is a private multilingual phone conversation between User and Companion. Preserve short replies faithfully. When Chinese and English hypotheses disagree, use the conversation context and specialist recognizer evidence rather than guessing.';
 const SPEECH_AUDIO_CONSTRAINTS={channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true};
@@ -15,7 +25,7 @@ let audioGeneration=0,audioQueue=Promise.resolve(),eventStream=null;
 const turnHeardCues=new Map();
 let audioCtx=null,currentSource=null,audioFetches=new Set(),pendingAudioSegments=0,assistantFinished=false,seenAudioSegments=new Set(),pcmWorkletLoadPromise=null;
 let bodyHearingWorker=null,bodyHearingReady=false,bodyHearingLoading=false,bodyHearingEnabled=false;
-let voiceToneWorker=null,voiceToneReady=false,voiceToneLoading=false,voiceToneEnabled=true,voiceToneBaseline=null,voiceToneRequestSeq=0;
+let voiceToneWorker=null,voiceToneReady=false,voiceToneLoading=false,voiceToneEnabled=true,voiceToneBaseline=null,voiceToneRequestSeq=0,emotionShadowEnabled=false;
 const voiceTonePending=new Map();
 let sfxBus=null,activeSfxSources=new Set();
 let binauralHrirBuffer=null,binauralLoadPromise=null;
@@ -229,6 +239,7 @@ async function openHistoryDetail(item,{returnTo=null}={}){
         const words=document.createElement('div');words.className='memory-words';renderNaturalBubbleText(words,part);stack.append(words);
       }
       row.append(who,stack);
+      if(turn.speaker==='user'&&turn.emotionShadow)renderEmotionShadow(row,turn.emotionShadow);
       if(turn.speaker==='assistant'&&turn.heardCues)renderHeardCues(row,turn.heardCues,{history:true});
       const segments=turn.speaker==='assistant'?(byTurn.get(turn.turnId)||[]):[];
       if(segments.length){
@@ -330,7 +341,7 @@ async function loadSttProviders(){
   providersLoadPromise=(async()=>{
     const select=$('stt-provider');if(!select)return;
     const data=await api('/api/stt/providers',{},'GET');
-    const available=data.providers||{};
+    const available=data.providers||{};emotionShadowEnabled=!!data.emotionShadow?.ready;
     for(const option of select.options)option.disabled=!available[option.value];
     let saved='';try{saved=localStorage.getItem('companion-voice-runtime.stt-provider')||'';}catch{}
     let desired=available[saved]?saved:(available.assemblyai?'assemblyai':(available.scribe?'scribe':(data.default||'scribe')));
@@ -390,8 +401,13 @@ $('tts-tone').addEventListener('change',()=>{
 });
 function syncCallPresence(){
   if(!callId)return Promise.resolve();
-  return api('/api/calls/'+callId+'/presence',{visible:callSurfaceVisible&&!document.hidden,muted}).catch(()=>{});
+  const hearingHealthy=Object.values(hearingState).some(Boolean)&&audioCtx?.state==='running'&&!scribe?.needsReconnect?.();
+  return api('/api/calls/'+callId+'/presence',{visible:callSurfaceVisible&&!document.hidden,muted,quietHangupEnabled,hearingHealthy,engaged:Date.now()-lastLocalSpeechAt<3000||!!$('typed-input')?.value.trim()}).catch(()=>{});
 }
+setInterval(()=>{if(callId)syncCallPresence();},10000);
+$('typed-input')?.addEventListener('input',()=>{if(callId)syncCallPresence();});
+$('quiet-hangup-toggle')?.addEventListener('change',e=>{quietHangupEnabled=e.target.checked;try{localStorage.setItem('companion-voice-runtime.quiet-hangup',quietHangupEnabled?'on':'off');}catch{}syncCallPresence();});
+if($('quiet-hangup-toggle'))$('quiet-hangup-toggle').checked=quietHangupEnabled;
 document.addEventListener('visibilitychange',()=>{
   if(document.hidden){if(callId)lastCallSurfaceHiddenAt=Date.now();syncCallPresence();return;}
   if(!callId){updateVoiceScheduleNote();return;}
@@ -472,6 +488,20 @@ function heardConfidence(score){
   const pct=Math.round(value*100);
   const word=value>=.78?'很清楚':value>=.60?'有听见':'很轻';
   return pct+'% · '+word;
+}
+function emotionShadowText(value){
+  const top=Array.isArray(value?.top)?value.top:[];
+  return top.slice(0,3).map(item=>{
+    const label=String(item?.label||'').split('/').pop().replace('<unk>','unknown');
+    return label+' '+Math.round(Math.max(0,Math.min(1,Number(item?.score)||0))*100)+'%';
+  }).join(' · ');
+}
+function renderEmotionShadow(row,value){
+  if(!row)return;
+  const text=emotionShadowText(value);if(!text)return;
+  const note=document.createElement('div');note.className='emotion-shadow-note';
+  note.textContent='Shadow · emotion2vec: '+text+(value?.inferenceMs?' · '+Math.round(Number(value.inferenceMs))+'ms':'');
+  row.append(note);
 }
 function renderHeardCues(row,cues,{history=false}={}){
   if(!row)return;
@@ -627,7 +657,7 @@ function ensureVoiceToneWorker(){
   if(voiceToneWorker&&!voiceToneReady&&!voiceToneLoading){try{voiceToneWorker.terminate();}catch{}voiceToneWorker=null;}
   if(voiceToneLoading)return voiceToneLoading;
   voiceToneLoading=new Promise((resolve,reject)=>{
-    const worker=new Worker(BASE+'/voice-prosody-worker.js?v=voice-tone-3',{type:'module'});
+    const worker=new Worker(BASE+'/voice-prosody-worker.js?v=voice-tone-4-shadow',{type:'module'});
     let settled=false;
     const timeout=setTimeout(()=>{if(!settled){settled=true;voiceToneReady=false;voiceToneNote('本机处理 · 不可用 · 超时');try{worker.terminate();}catch{}if(voiceToneWorker===worker)voiceToneWorker=null;reject(new Error('voice_tone_load_timeout'));}},5000);
     worker.onmessage=event=>{
@@ -639,7 +669,7 @@ function ensureVoiceToneWorker(){
       }
       if(data.type==='summary'){
         const pending=voiceTonePending.get(data.requestId);
-        if(pending){voiceTonePending.delete(data.requestId);pending.resolve(data.summary||null);}
+        if(pending){voiceTonePending.delete(data.requestId);pending.resolve({summary:data.summary||null,pcmBuffer:data.pcmBuffer||null});}
         return;
       }
       if(data.type==='error'){
@@ -680,14 +710,20 @@ function startVoiceToneTurn(){
 }
 function resetVoiceToneTurn(){voiceToneWorker?.postMessage({type:'reset'});}
 function countSpeechChars(text){return Array.from(String(text||'').replace(/[\s，。！？、,.!?…~～"'“”‘’：:；;（）()\[\]{}]/g,'')).length;}
-async function finishVoiceToneTurn(text,voiceDurationMs=0){
+function submitEmotionShadow(id,utteranceId,pcmBuffer){
+  if(!emotionShadowEnabled||!id||!utteranceId||!pcmBuffer?.byteLength)return;
+  fetch(BASE+'/api/calls/'+id+'/emotion-shadow',{method:'POST',headers:{'content-type':'application/octet-stream','x-utterance-id':utteranceId,'x-sample-rate':'16000'},body:pcmBuffer,credentials:'same-origin'}).catch(()=>{});
+}
+async function finishVoiceToneTurn(text,voiceDurationMs=0,{shadowCallId='',utteranceId=''}={}){
   if(!voiceToneEnabled||!voiceToneWorker||!voiceToneReady)return null;
   const requestId=++voiceToneRequestSeq;
-  const raw=await new Promise(resolve=>{
+  const envelope=await new Promise(resolve=>{
     const timer=setTimeout(()=>{voiceTonePending.delete(requestId);resolve(null);},650);
     voiceTonePending.set(requestId,{resolve:value=>{clearTimeout(timer);resolve(value);}});
     voiceToneWorker.postMessage({type:'finish',requestId});
   });
+  if(envelope?.pcmBuffer)submitEmotionShadow(shadowCallId,utteranceId,envelope.pcmBuffer);
+  const raw=envelope?.summary||null;
   if(!raw)return null;
   const chars=countSpeechChars(text);
   const seconds=Math.max(0.35,Number(raw.voicedDurationMs||voiceDurationMs||raw.activeDurationMs||0)/1000);
@@ -1074,6 +1110,7 @@ function subscribe(){
   // also be attached to a later Companion turn as expandable context.
   stream.addEventListener('nonverbal_heard',e=>{const d=JSON.parse(e.data||'{}');if(!d?.label)return;const pct=Math.round(Math.max(0,Math.min(1,Number(d.score)||0))*100);addHeardLine('听见：'+String(d.label)+(pct?' · '+pct+'%':''));});
   stream.addEventListener('voice_tone',()=>{});
+  stream.addEventListener('emotion_shadow',e=>{const d=JSON.parse(e.data||'{}'),top=Array.isArray(d.top)?d.top:[];if(!top.length)return;const text=top.slice(0,3).map(x=>String(x.label||'').split('/').pop()+' '+Math.round((Number(x.score)||0)*100)+'%').join(' · ');addHeardLine('Shadow · emotion2vec: '+text+' · '+Math.round(Number(d.inferenceMs)||0)+'ms');});
   stream.addEventListener('error',e=>{
     if(e.data){const d=JSON.parse(e.data);audioNote(d.code);if(pendingTypedText&&$('typed-input')&&!$('typed-input').value){$('typed-input').value=pendingTypedText;pendingTypedText='';}setStatus('刚才那句没有送到 Companion，已把文字放回输入框。');return;}
     const id=callId;if(!id||stream!==eventStream)return;setStatus('正在重新连接通话…');
@@ -1141,20 +1178,21 @@ async function startScribe(){
       noVerbatim:false
     });
   }catch(error){cleanup();try{connection?.close();}catch{}throw error;}
-  connection.on(RealtimeEvents.OPEN,()=>{opened=true;setStatus('');});
+  connection.on(RealtimeEvents.OPEN,()=>{opened=true;reportSttState('scribe','ready');setStatus('');});
   connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT,data=>{
-    if(muted)return;
+    if(muted)return;lastLocalSpeechAt=Date.now();
     if(!voiceStartedAt){voiceStartedAt=Date.now();startVoiceToneTurn();api('/api/calls/'+callId+'/stt',{type:'voice_start'}).catch(()=>{});}
     api('/api/calls/'+callId+'/stt',{type:'partial',text:data.text,provider:'scribe'}).catch(()=>{});
   });
   connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT,async data=>{
     if(muted)return;
     const duration=voiceStartedAt?Date.now()-voiceStartedAt:0;voiceStartedAt=0;
-    const prosody=await finishVoiceToneTurn(data.text,duration);
-    api('/api/calls/'+callId+'/stt',{type:'committed',text:data.text,voiceDurationMs:duration,provider:'scribe',prosody}).catch(error=>setStatus(error.message));
+    const utteranceId=crypto.randomUUID();
+    const prosody=await finishVoiceToneTurn(data.text,duration,{shadowCallId:callId,utteranceId});
+    api('/api/calls/'+callId+'/stt',{type:'committed',text:data.text,voiceDurationMs:duration,provider:'scribe',utteranceId,prosody}).catch(error=>setStatus(error.message));
   });
-  connection.on(RealtimeEvents.ERROR,error=>setStatus('听写错误：'+(error?.error||'连接失败')));
-  connection.on(RealtimeEvents.CLOSE,()=>{opened=false;cleanup();if(callId&&!micReconnectPromise)setStatus('听写已断开');});
+  connection.on(RealtimeEvents.ERROR,error=>{reportSttState('scribe','failed',error?.error||'client_error');setStatus('听写错误：'+(error?.error||'连接失败'));});
+  connection.on(RealtimeEvents.CLOSE,()=>{opened=false;reportSttState('scribe','closed');cleanup();if(callId&&!micReconnectPromise)setStatus('听写已断开');});
   scribe={
     setMuted(value){for(const track of stream.getAudioTracks())track.enabled=!value;if(value){resetBodyHearing();resetVoiceToneTurn();}},
     updateContext(){},
@@ -1189,20 +1227,22 @@ async function startTencentSttForStream(stream,onMessage){
       onMessage,
       onState:event=>{
         if(!status)return;
-        if(event?.error)status.textContent='Fallback · '+(event.errorMessage||('error '+event.error));
-        else if(event?.state==='started')status.textContent='运行中 · 中文 + 混合语音';
+        if(event?.error){reportSttState('tencent','failed',event.error);status.textContent='Fallback · '+(event.errorMessage||('error '+event.error));}
+        else if(event?.state==='started'){reportSttState('tencent','ready');status.textContent='运行中 · 中文 + 混合语音';}
         else if(event?.state==='stopped')status.textContent='已就绪 · 中文 + 混合语音';
       },
-      onError:error=>{if(status)status.textContent='Fallback · '+String(error?.message||error);}
+      onError:error=>{reportSttState('tencent','failed',error?.code||error?.name||'client_error');if(status)status.textContent='Fallback · '+String(error?.message||error);}
     });
-    tencentStt=client;
+    tencentStt=client;reportSttState('tencent','ready');
     if(status)status.textContent='运行中 · 中文 + 混合语音';
     return client;
   }catch(error){
+    reportSttState('tencent','failed',error?.code||error?.name||'start_failed');
     if(status){
       const message=String(error?.message||error);
       status.textContent=/2026|not.?enabled/i.test(message)?'需要先启用 Speech AI':'Fallback · 仅 AssemblyAI';
     }
+    if(callId&&tencentSttConfigured)room.toast('Tencent STT 暂不可用，正在使用备用识别。');
     return null;
   }
 }
@@ -1214,14 +1254,14 @@ async function startAssemblyAI(){
   const [stream]=await Promise.all([mediaPromise,workletPromise]);
   micReadyMs=Math.round(performance.now()-connectingAt);
   const usageCallId=callId;
-  const PRE_ROLL_CHUNKS=30; // ~3 seconds at the 100 ms PCM worklet cadence.
-  const ASSEMBLY_IDLE_SLEEP_MS=30000,ASSEMBLY_IDLE_CHECK_MS=2000;
+  const PRE_ROLL_CHUNKS=60; // ~6 seconds at the 100 ms PCM worklet cadence; helps rescue a turn during fallback startup.
+  const ASSEMBLY_IDLE_SLEEP_MS=30000,ASSEMBLY_IDLE_CHECK_MS=2000,FALLBACK_KEEP_AWAKE_MS=90000,TENCENT_STABLE_BEFORE_SLEEP_MS=30000;
   let socket=null,cloudReady=false,cloudSleeping=false,cloudConnectPromise=null,cloudGeneration=0,tencentGeneration=0;
   let source=null,node=null,silentGain=null,processor=null,closed=false,stopMeter=null,tencentSidecar=null,micInterrupted=false;
   const turnBuffer=new SttTurnBuffer();let lastHybridCommitAt=0,commitBusy=false,turnTimer=null;
   let assemblyFallbackId=0,tencentFallbackId=0,assemblyUsage=null;
   let agentContext=ASSEMBLY_INITIAL_CONTEXT,lastVoiceActivityAt=Date.now(),noiseFloor=.0035,voiceHits=0;
-  let preRoll=[],inactivityTimer=null;
+  let preRoll=[],inactivityTimer=null,tencentRetryTimer=null,tencentRetryAttempt=0,tencentRecoveryInFlight=false,tencentHealthySince=0,assemblyKeepAwakeUntil=0;
   const intentionalSockets=new WeakSet();
   const micTrack=stream.getAudioTracks()[0];
   try{if(micTrack&&'contentHint' in micTrack)micTrack.contentHint='speech';}catch{}
@@ -1258,7 +1298,7 @@ async function startAssemblyAI(){
     commitBusy=true;const duration=voiceStartedAt?Date.now()-voiceStartedAt:choice.durationMs;voiceStartedAt=0;
     const utteranceId=crypto.randomUUID();
     try{
-      const prosody=await finishVoiceToneTurn(choice.text,duration);
+      const prosody=await finishVoiceToneTurn(choice.text,duration,{shadowCallId:usageCallId,utteranceId});
       if(closed||muted||callId!==usageCallId)return;
       await api('/api/calls/'+usageCallId+'/stt',{type:'committed',text:choice.text,voiceDurationMs:duration,provider:choice.provider,endOfTurn:true,clientEndpointed:true,utteranceId,prosody,candidates:choice.candidates});
       lastHybridCommitAt=Date.now();
@@ -1292,11 +1332,36 @@ async function startAssemblyAI(){
   const flushAssemblyUsage=()=>{if(assemblyUsage)recordAssemblyUsage(assemblyUsage,{}, {keepalive:true});};
   window.addEventListener('pagehide',flushAssemblyUsage);
   const closeTencent=()=>{
+    clearTimeout(tencentRetryTimer);tencentRetryTimer=null;tencentRecoveryInFlight=false;
+    reportSttState('tencent','closed');
     const sidecar=tencentSidecar||tencentStt;tencentSidecar=null;tencentGeneration++;
     if(sidecar){sidecar.close().catch(()=>{});if(tencentStt===sidecar)tencentStt=null;}
   };
+  const scheduleTencentRetry=()=>{
+    if(closed||muted||!tencentSttConfigured||hearingState.tencent||tencentRecoveryInFlight||tencentRetryTimer)return;
+    const delays=[1200,3000,6000,12000,20000,30000];
+    const delay=delays[Math.min(tencentRetryAttempt,delays.length-1)];tencentRetryAttempt++;
+    tencentRetryTimer=setTimeout(()=>{tencentRetryTimer=null;restartTencentSidecar().catch(()=>{});},delay);
+  };
+  const restartTencentSidecar=async()=>{
+    if(closed||muted||!tencentSttConfigured||hearingState.tencent||tencentRecoveryInFlight)return tencentSidecar;
+    tencentRecoveryInFlight=true;
+    const stale=tencentSidecar||tencentStt;tencentSidecar=null;tencentGeneration++;
+    if(stale){try{await stale.close();}catch{}if(tencentStt===stale)tencentStt=null;}
+    const tg=++tencentGeneration;
+    try{
+      const client=await startTencentSttForStream(stream,message=>{if(!closed&&!muted&&tg===tencentGeneration)onTencentMessage(message);});
+      if(client&&(closed||muted||tg!==tencentGeneration)){client.close().catch(()=>{});if(tencentStt===client)tencentStt=null;return null;}
+      if(client){tencentSidecar=client;tencentRetryAttempt=0;tencentHealthySince=Date.now();return client;}
+      return null;
+    }finally{
+      tencentRecoveryInFlight=false;
+      if(!closed&&!muted&&!hearingState.tencent)scheduleTencentRetry();
+    }
+  };
   const closeCloud=({sleeping=true,keepTencent=false}={})=>{
     cloudGeneration++;
+    reportSttState('assemblyai','closed');
     cloudReady=false;cloudSleeping=!!sleeping;
     if(!keepTencent)closeTencent();
     const ws=socket;socket=null;
@@ -1314,14 +1379,7 @@ async function startAssemblyAI(){
     cloudSleeping=false;
     cloudConnectPromise=(async()=>{
       const existingTencent=tencentSidecar;
-      const tencentReady=existingTencent?Promise.resolve(existingTencent):(()=>{
-        const tg=++tencentGeneration;
-        return startTencentSttForStream(stream,message=>{if(!closed&&!muted&&tg===tencentGeneration)onTencentMessage(message);}).then(client=>{
-          if(client&&(closed||muted||tg!==tencentGeneration)){client.close().catch(()=>{});if(tencentStt===client)tencentStt=null;return null;}
-          if(client)tencentSidecar=client;
-          return client;
-        }).catch(()=>null);
-      })();
+      const tencentReady=existingTencent?Promise.resolve(existingTencent):restartTencentSidecar().catch(()=>null);
       const {token}=await api('/api/calls/'+usageCallId+'/stt-token',{provider:'assemblyai'});
       if(closed||muted||generation!==cloudGeneration)return false;
       const url=new URL('wss://streaming.assemblyai.com/v3/ws');
@@ -1337,7 +1395,7 @@ async function startAssemblyAI(){
       const beginPromise=new Promise((resolve,reject)=>{
         const timeout=setTimeout(()=>reject(new Error('AssemblyAI 连接超时')),12000);
         ws.addEventListener('message',event=>{let d;try{d=JSON.parse(event.data);}catch{return;}if(d.type==='Begin'){clearTimeout(timeout);resolve(d);}}, {once:false});
-        ws.addEventListener('error',()=>{clearTimeout(timeout);reject(new Error('AssemblyAI 连接失败'));},{once:true});
+        ws.addEventListener('error',()=>{clearTimeout(timeout);reject(new Error('AssemblyAI connection failed'));},{once:true});
       });
       ws.onmessage=async event=>{
         let data;try{data=JSON.parse(event.data);}catch{return;}
@@ -1362,24 +1420,24 @@ async function startAssemblyAI(){
       ws.onclose=()=>{
         recordAssemblyUsage(usage);
         if(assemblyUsage===usage)assemblyUsage=null;
-        if(socket===ws){socket=null;cloudReady=false;}
+        if(socket===ws){socket=null;cloudReady=false;reportSttState('assemblyai','closed');}
         if(closed||intentionalSockets.has(ws)||generation!==cloudGeneration)return;
         cloudSleeping=true;
         if(callId&&!muted&&!micReconnectPromise)setStatus(tencentSidecar?'STT · 轻休眠':'STT · 休眠中');
       };
       await beginPromise;
       if(closed||muted||generation!==cloudGeneration){intentionalSockets.add(ws);try{ws.send(JSON.stringify({type:'Terminate'}));}catch{};setTimeout(()=>{try{ws.close();}catch{}},500);return false;}
+      reportSttState('assemblyai','ready');
       cloudReady=true;cloudSleeping=false;lastVoiceActivityAt=Date.now();
       const buffered=preRoll.slice();
       for(const chunk of buffered){if(ws.readyState===WebSocket.OPEN)try{ws.send(chunk);usage.audioSeconds+=chunk.byteLength/32000;}catch{}}
       assemblyReadyMs=Math.round(performance.now()-connectingAt);
-      const client=await tencentReady;tencentReadyMs=Math.round(performance.now()-connectingAt);
-      if(client&&existingTencent!==client)tencentSidecar=client;
+      tencentReady.then(client=>{tencentReadyMs=Math.round(performance.now()-connectingAt);if(client&&existingTencent!==client)tencentSidecar=client;}).catch(()=>{});
       if(!closed&&!muted)setStatus('');
       return true;
     })().catch(error=>{
       if(generation===cloudGeneration)closeCloud({sleeping:true,keepTencent:!!tencentSidecar});
-      if(!closed&&!muted){cloudSleeping=true;setStatus(reason==='initial'&&!tencentSidecar?'声音连接中断了，可以先打字。':(tencentSidecar?'STT · 轻休眠':'STT · 休眠中'));}
+      if(!closed&&!muted){cloudSleeping=true;setStatus(reason==='initial'&&!tencentSidecar?'声音识别暂时不可用，可以先打字。':(tencentSidecar?'STT · 轻休眠':'STT · 休眠中'));}
       return false;
     }).finally(()=>{cloudConnectPromise=null;});
     return cloudConnectPromise;
@@ -1391,7 +1449,7 @@ async function startAssemblyAI(){
   const sendAudio=buffer=>{
     if(!buffer?.byteLength)return;
     feedBodyHearing(buffer);feedVoiceTone(buffer);rememberPreRoll(buffer);
-    if(!muted&&localSpeech(buffer)){lastVoiceActivityAt=Date.now();turnBuffer.speech();maybeWake('local');}
+    if(!muted&&localSpeech(buffer)){lastLocalSpeechAt=Date.now();lastVoiceActivityAt=Date.now();turnBuffer.speech();maybeWake('local');}
     if(!muted&&cloudReady&&socket?.readyState===WebSocket.OPEN){
       try{socket.send(buffer);if(assemblyUsage)assemblyUsage.audioSeconds+=buffer.byteLength/32000;}catch{}
     }
@@ -1403,14 +1461,17 @@ async function startAssemblyAI(){
       source=audioCtx.createMediaStreamSource(stream);processor=audioCtx.createScriptProcessor(4096,1,1);silentGain=audioCtx.createGain();silentGain.gain.value=0;processor.onaudioprocess=e=>sendAudio(downsamplePCM16(e.inputBuffer.getChannelData(0),audioCtx.sampleRate));source.connect(processor);processor.connect(silentGain);silentGain.connect(audioCtx.destination);
     }
   }catch(error){for(const track of stream.getTracks())track.stop();try{source?.disconnect();node?.disconnect();processor?.disconnect();silentGain?.disconnect();}catch{}throw error;}
-  stopMeter=room.measure(source,'yau');
+  stopMeter=room.measure(source,'user');
   // Hybrid light sleep: after 30s of silence only AssemblyAI sleeps. Tencent
   // remains online and can wake AssemblyAI even for speech below the local RMS threshold.
   turnTimer=setInterval(()=>commitReadyTurn().catch(()=>{}),120);
   inactivityTimer=setInterval(()=>{
-    if(closed||muted||cloudSleeping||!cloudReady||cloudConnectPromise||!tencentSidecar)return;
+    const now=Date.now();
+    if(closed||muted||cloudSleeping||!cloudReady||cloudConnectPromise||!tencentSidecar||!hearingState.tencent)return;
     if(voiceStartedAt||commitBusy)return;
-    if(Date.now()-lastVoiceActivityAt<ASSEMBLY_IDLE_SLEEP_MS)return;
+    if(now<assemblyKeepAwakeUntil)return;
+    if(!tencentHealthySince||now-tencentHealthySince<TENCENT_STABLE_BEFORE_SLEEP_MS)return;
+    if(now-lastVoiceActivityAt<ASSEMBLY_IDLE_SLEEP_MS)return;
     closeCloud({sleeping:true,keepTencent:true});
   },ASSEMBLY_IDLE_CHECK_MS);
   scribe={
@@ -1424,6 +1485,10 @@ async function startAssemblyAI(){
       if(cloudReady&&socket?.readyState===WebSocket.OPEN&&text)try{socket.send(JSON.stringify({type:'UpdateConfiguration',agent_context:agentContext,keyterms:STT_KEYTERMS}));}catch{}
     },
     needsReconnect(){return micInterrupted||closed||stream.getAudioTracks().some(track=>track.readyState!=='live');},
+    noteTencentReady(){tencentHealthySince=Date.now();tencentRetryAttempt=0;clearTimeout(tencentRetryTimer);tencentRetryTimer=null;},
+    noteTencentFailed(){tencentHealthySince=0;assemblyKeepAwakeUntil=Math.max(assemblyKeepAwakeUntil,Date.now()+FALLBACK_KEEP_AWAKE_MS);},
+    recoverRecognition(){if(!closed&&!muted&&!cloudReady)connectCloud({reason:'tencent-fallback'}).catch(()=>{});},
+    recoverTencent(){scheduleTencentRetry();},
     isSleeping(){return cloudSleeping;},
     disconnect(){
       if(closed)return;closed=true;clearInterval(inactivityTimer);inactivityTimer=null;window.removeEventListener('pagehide',flushAssemblyUsage);flushAssemblyUsage();
@@ -1435,8 +1500,8 @@ async function startAssemblyAI(){
     }
   };
   const initial=await connectCloud({reason:'initial'});
-  audioNote('连接耗时 · mic '+micReadyMs+'ms · AssemblyAI '+assemblyReadyMs+'ms · Tencent '+tencentReadyMs+'ms');
-  if(!initial&&!closed&&!tencentSidecar){scribe.disconnect();scribe=null;throw new Error('AssemblyAI 连接失败');}
+  audioNote('Connect · mic '+micReadyMs+'ms · AssemblyAI '+assemblyReadyMs+'ms · Tencent '+tencentReadyMs+'ms');
+  if(!initial&&!closed&&!tencentSidecar){scribe.disconnect();scribe=null;throw new Error('AssemblyAI connection failed');}
   if(!initial&&tencentSidecar){cloudSleeping=true;setStatus('STT · 轻休眠');}else setStatus('');
 }
 
@@ -1622,14 +1687,14 @@ $('mute').onclick=()=>{if(!callId)return;setMutedState(!muted);room.haptic();roo
 $('reconnect-mic')?.addEventListener('click',()=>{room.haptic();reconnectMicrophone({force:true,quiet:false});});
 function finishLostCallUi(message='这通电话已经结束。'){
   if(!callId)return;
-  callId=null;scribe?.disconnect?.();scribe=null;eventStream?.close();eventStream=null;stopAudio();clearInterval(timer);currentCallPlaybackRate=1;seenAudioSegments=new Set();turnHeardCues.clear();realSfxRecent=[];resetBodyHearing();resetVoiceToneTurn();muted=false;
+  callId=null;Object.keys(hearingState).forEach(key=>hearingState[key]=false);scribe?.disconnect?.();scribe=null;eventStream?.close();eventStream=null;stopAudio();clearInterval(timer);currentCallPlaybackRate=1;seenAudioSegments=new Set();turnHeardCues.clear();realSfxRecent=[];resetBodyHearing();resetVoiceToneTurn();muted=false;
   $('typed-input').disabled=true;$('typed-send').disabled=true;$('typed-input').value='';for(const key of ['call','stt-provider','tts-model','tts-tone','tts-preview'])$(key).disabled=false;
   room.foyer();$('timer').textContent='00:00';setStatus(message);loadCallHistory().catch(()=>{});updateVoiceScheduleNote();
 }
 async function finishCall({failed=false}={}){
   if(ending)return;ending=true;
   const id=callId;room.phase('ending');setStatus('和 Companion 的通话结束了');
-  callId=null;scribe?.disconnect?.();scribe=null;eventStream?.close();eventStream=null;
+  callId=null;Object.keys(hearingState).forEach(key=>hearingState[key]=false);scribe?.disconnect?.();scribe=null;eventStream?.close();eventStream=null;
   stopAudio();clearInterval(timer);currentCallPlaybackRate=1;seenAudioSegments=new Set();turnHeardCues.clear();realSfxRecent=[];resetBodyHearing();resetVoiceToneTurn();setMutedState(false);
   $('typed-input').disabled=true;$('typed-send').disabled=true;$('typed-input').value='';
   let saved=true;
